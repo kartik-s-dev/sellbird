@@ -1,3 +1,4 @@
+from harvey.agents.scout import Scout
 """Tests for multi-product data models."""
 
 import pytest
@@ -307,3 +308,62 @@ async def test_products_retrieve_only_their_own_companies_and_prospects(tmp_path
 
     assert await state.get_product_companies("unknown-product") == []
     assert await state.get_product_prospects("unknown-product") == []
+from harvey.agents.scout import Scout
+
+
+@pytest.mark.asyncio
+async def test_scout_links_created_prospect_to_its_product(tmp_path):
+    state = StateManager(str(tmp_path / "scout_product.db"))
+    await state.init_db()
+
+    await state.add_product(Product(id="p1", name="CRM"))
+    await state.add_company(Company(id="c1", name="Acme"))
+
+    await state.add_prospect(
+        Prospect(
+            id="scout-prospect-1",
+            company_id="c1",
+            first_name="Jane",
+            last_name="Doe",
+            title="CEO",
+        )
+    )
+
+    scout = Scout.__new__(Scout)
+    scout.state = state
+    scout.product_id = "p1"
+
+    await scout._link_prospect_to_product("scout-prospect-1")
+
+    linked = await state.get_product_prospects("p1")
+
+    assert [prospect.id for prospect in linked] == ["scout-prospect-1"]
+
+
+@pytest.mark.asyncio
+async def test_scout_without_product_id_does_not_create_product_link(tmp_path):
+    state = StateManager(str(tmp_path / "scout_legacy.db"))
+    await state.init_db()
+
+    await state.add_product(Product(id="p1", name="CRM"))
+    await state.add_company(Company(id="c1", name="Acme"))
+
+    await state.add_prospect(
+        Prospect(
+            id="legacy-prospect-1",
+            company_id="c1",
+            first_name="John",
+            last_name="Doe",
+            title="Manager",
+        )
+    )
+
+    scout = Scout.__new__(Scout)
+    scout.state = state
+    scout.product_id = None
+
+    await scout._link_prospect_to_product("legacy-prospect-1")
+
+    linked = await state.get_product_prospects("p1")
+
+    assert linked == []
