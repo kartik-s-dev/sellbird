@@ -56,10 +56,12 @@ class Sender:
         state: StateManager,
         config: HarveyConfig,
         env: EnvConfig,
+        product_id: str | None = None,
     ):
         self.brain = brain
         self.state = state
         self.config = config
+        self.product_id = product_id
         self.instantly = InstantlyClient(env.instantly_api_key)
         self.provider = get_mail_provider(config, env)
         # Disabled in tests to skip inter-send sleeps.
@@ -83,7 +85,7 @@ class Sender:
             return
 
         logger.info("Sender: Checking for campaigns to deploy...")
-        draft_campaigns = await self.state.get_campaigns_by_status("draft")
+        draft_campaigns = await self._get_draft_campaigns()
         if not draft_campaigns:
             logger.info("Sender: No draft campaigns to deploy.")
             return
@@ -101,6 +103,12 @@ class Sender:
                 await self._deploy_campaign(campaign)
             except Exception as e:
                 logger.error(f"Sender: Failed to deploy campaign {campaign.name}: {e}")
+
+    async def _get_draft_campaigns(self):
+        campaigns = await self.state.get_campaigns_by_status("draft")
+        if self.product_id is None:
+            return campaigns
+        return [c for c in campaigns if c.product_id == self.product_id]
 
     def _validate_sequence(self, campaign) -> bool:
         """Never deploy a broken or empty sequence."""
@@ -123,9 +131,15 @@ class Sender:
 
     async def _deploy_campaign(self, campaign):
         """Deploy a single campaign to Instantly. Idempotent: safe to retry."""
+        if self.product_id is not None and campaign.product_id != self.product_id:
+            logger.warning("Sender: Skipping campaign belonging to another product.")
+            return
         logger.info(f"Sender: Deploying campaign '{campaign.name}'...")
 
         # 0. Validate before touching the network
+        if self.product_id is not None and campaign.product_id != self.product_id:
+            logger.warning("Sender: Skipping campaign belonging to another product.")
+            return
         if not self._validate_sequence(campaign):
             await self.state.update_campaign(campaign.id, status="failed")
             return
@@ -323,7 +337,7 @@ class Sender:
             )
             return
 
-        for campaign in await self.state.get_campaigns_by_status("draft"):
+        for campaign in await self._get_draft_campaigns():
             try:
                 await self._stage_campaign_native(campaign)
             except Exception as e:
@@ -435,7 +449,8 @@ class Sender:
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         due = await self.state.get_outbox(
-            status="approved", due_before=now, limit=budget * 3
+            status="approved", due_before=now, limit=budget * 3,
+            product_id=self.product_id
         )
         if not due:
             return

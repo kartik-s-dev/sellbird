@@ -153,7 +153,7 @@ class UsageConfig(BaseModel):
         return v
 
 
-BRAIN_PROVIDERS = ("claude", "codex")
+BRAIN_PROVIDERS = ("claude", "codex", "ollama")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Model names are passed to a CLI, so they must look like a model name and
@@ -212,7 +212,38 @@ class HarveyConfig(BaseModel):
     channels: ChannelsConfig = ChannelsConfig()
     usage: UsageConfig = UsageConfig()
     brain: BrainConfig = BrainConfig()
+def config_for_product(config: HarveyConfig, product) -> HarveyConfig:
+    """Return a copy of HarveyConfig using one product's stored context.
 
+    Shared persona, channels, usage, and brain settings remain unchanged.
+    Missing ICP fields stay empty rather than being invented.
+    """
+    product_config = ProductConfig(
+        name=product.name,
+        description=product.description or "",
+        pricing=product.pricing or "",
+        key_benefits=product.key_benefits or [],
+        objection_responses=product.objection_responses or {},
+        offer=OfferConfig.model_validate(product.offer or {}),
+    )
+
+    icp_data = product.icp or {}
+    icp_config = ICPConfig(
+        industries=icp_data.get("industries", []),
+        company_size=icp_data.get("company_size", ""),
+        titles=icp_data.get("titles", []),
+        geography=icp_data.get("geography", []),
+        hiring_signals=icp_data.get("hiring_signals", []),
+        geo_coordinates=icp_data.get("geo_coordinates", {}),
+    )
+
+    return config.model_copy(
+        update={
+            "product": product_config,
+            "icp": icp_config,
+        },
+        deep=True,
+    )
 
 class EnvConfig(BaseModel):
     instantly_api_key: str = ""

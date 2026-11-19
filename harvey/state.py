@@ -19,6 +19,7 @@ import aiosqlite
 
 from harvey.models.company import Company
 from harvey.models.prospect import Prospect
+from harvey.models.product import Product
 from harvey.models.campaign import Campaign, EmailStep  # noqa: F401 (EmailStep re-exported)
 from harvey.models.conversation import Conversation, Message  # noqa: F401
 
@@ -44,13 +45,13 @@ def _norm(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
-# ── Schema migrations ─────────────────────────────────────────────────
+# â”€â”€ Schema migrations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Each entry is an idempotent SQL script. The index into this list + 1 is
 # the schema version stored in PRAGMA user_version. Never edit or reorder
-# released migrations — append new ones.
+# released migrations â€” append new ones.
 
 MIGRATIONS: list[str] = [
-    # ── v1: base schema (idempotent, so pre-migration DBs adopt cleanly) ──
+    # â”€â”€ v1: base schema (idempotent, so pre-migration DBs adopt cleanly) â”€â”€
     """
     CREATE TABLE IF NOT EXISTS companies (
         id TEXT PRIMARY KEY,
@@ -155,7 +156,7 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_feedback_entity ON feedback(entity_type, entity_id);
     CREATE INDEX IF NOT EXISTS idx_usage_date ON usage_log(date);
     """,
-    # ── v2: normalize identity keys, dedup, uniqueness, hot-path indexes ──
+    # â”€â”€ v2: normalize identity keys, dedup, uniqueness, hot-path indexes â”€â”€
     """
     -- Normalize emails/domains so uniqueness is case-insensitive going forward.
     UPDATE prospects SET email = LOWER(TRIM(email)) WHERE email != LOWER(TRIM(email));
@@ -189,7 +190,7 @@ MIGRATIONS: list[str] = [
     CREATE INDEX IF NOT EXISTS idx_prospects_status_updated ON prospects(status, updated_at);
     CREATE INDEX IF NOT EXISTS idx_actions_created_at ON actions(created_at);
     """,
-    # ── v3: per-call usage accounting (tokens, cost, attribution) ──
+    # â”€â”€ v3: per-call usage accounting (tokens, cost, attribution) â”€â”€
     """
     CREATE TABLE IF NOT EXISTS usage_events (
         id TEXT PRIMARY KEY,
@@ -218,11 +219,11 @@ MIGRATIONS: list[str] = [
     CREATE UNIQUE INDEX IF NOT EXISTS uq_usage_events_request
         ON usage_events(request_key) WHERE request_key != '';
     """,
-    # ── v4: honest email statuses + per-domain pattern cache ──
+    # â”€â”€ v4: honest email statuses + per-domain pattern cache â”€â”€
     """
     -- verified: a provider confirmed the mailbox exists
-    -- risky:    catch-all / accept-all domain — sendable only in low volume
-    -- guess:    pattern guess, never verified — never auto-sent
+    -- risky:    catch-all / accept-all domain â€” sendable only in low volume
+    -- guess:    pattern guess, never verified â€” never auto-sent
     -- invalid:  provider said undeliverable
     ALTER TABLE prospects ADD COLUMN email_status TEXT DEFAULT '';
 
@@ -242,12 +243,12 @@ MIGRATIONS: list[str] = [
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """,
-    # ── v5: buying signals on companies (tech stack, hiring, etc.) ──
+    # â”€â”€ v5: buying signals on companies (tech stack, hiring, etc.) â”€â”€
     """
     ALTER TABLE companies ADD COLUMN tech_stack_json TEXT DEFAULT '[]';
     ALTER TABLE companies ADD COLUMN signals_json TEXT DEFAULT '[]';
     """,
-    # ── v6: outbox (approval ladder + native sending) and settings KV ──
+    # â”€â”€ v6: outbox (approval ladder + native sending) and settings KV â”€â”€
     """
     -- Every outgoing email becomes an outbox row first. Status ladder:
     --   pending_review -> approved -> sent
@@ -290,7 +291,7 @@ MIGRATIONS: list[str] = [
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """,
-    # ── v7: observation model — every fact is a row, never a column ──
+    # â”€â”€ v7: observation model â€” every fact is a row, never a column â”€â”€
     """
     -- The governed vocabulary. A collector may only emit a code that exists
     -- here (enforced by the observations FK), so a typo fails loudly instead
@@ -362,7 +363,7 @@ MIGRATIONS: list[str] = [
 
     CREATE INDEX IF NOT EXISTS idx_runs_stage_started ON runs(stage, started_at);
     """,
-    # ── v8: discovery — entity resolution for businesses without a website ──
+    # â”€â”€ v8: discovery â€” entity resolution for businesses without a website â”€â”€
     """
     -- The best prospect for anyone selling websites is a business that has
     -- none, so `domain` cannot be the only identity key. `external_id` holds
@@ -375,7 +376,7 @@ MIGRATIONS: list[str] = [
         ON companies(external_id) WHERE external_id != '';
     """,
 
-    # ── v9: track prospect-backfill attempts on known companies ──
+    # â”€â”€ v9: track prospect-backfill attempts on known companies â”€â”€
     """
     -- Without this, a company that gets scraped for contacts and comes up
     -- empty (no team page, site blocked, etc.) is indistinguishable from one
@@ -384,7 +385,7 @@ MIGRATIONS: list[str] = [
     ALTER TABLE companies ADD COLUMN prospects_checked_at TIMESTAMP DEFAULT NULL;
     """,
 
-    # ── v10: same fix, for the profile collector ──
+    # â”€â”€ v10: same fix, for the profile collector â”€â”€
     """
     -- The profile collector only ever wrote an observation on a SUCCESSFUL
     -- fetch; an unreachable site produced zero rows despite the code's own
@@ -403,7 +404,7 @@ MIGRATIONS: list[str] = [
         SELECT DISTINCT company_id FROM observations WHERE collector = 'profile'
     );
     """,
-    # ── v11: which subscription each call ran on (claude | codex) ──
+        # â”€â”€ v11: which subscription each call ran on (claude | codex) â”€â”€
     """
     -- Every row before this migration was a Claude call.
     ALTER TABLE usage_events ADD COLUMN provider TEXT DEFAULT 'claude';
@@ -413,11 +414,68 @@ MIGRATIONS: list[str] = [
     -- so one subscription's budget never consumes the other's.
     ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
     """,
+       # â”€â”€ v12: track local Ollama calls separately â”€â”€
+    """
+    ALTER TABLE usage_log ADD COLUMN ollama_calls INTEGER DEFAULT 0;
+    """,
+
+    # â”€â”€ v13: multi-product support â”€â”€
+    """
+    CREATE TABLE IF NOT EXISTS products (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        pricing TEXT DEFAULT '',
+        key_benefits_json TEXT DEFAULT '[]',
+        objection_responses_json TEXT DEFAULT '{}',
+        offer_json TEXT DEFAULT '{}',
+        icp_json TEXT DEFAULT '{}',
+        business_context TEXT DEFAULT '',
+        qualification_rules_json TEXT DEFAULT '{}',
+        sales_context TEXT DEFAULT '',
+        is_active INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS product_companies (
+        product_id TEXT NOT NULL,
+        company_id TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (product_id, company_id),
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+        FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS product_prospects (
+        product_id TEXT NOT NULL,
+        prospect_id TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (product_id, prospect_id),
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+        FOREIGN KEY (prospect_id) REFERENCES prospects(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_products_active
+        ON products(is_active);
+    CREATE INDEX IF NOT EXISTS idx_product_companies_company
+        ON product_companies(company_id);
+    CREATE INDEX IF NOT EXISTS idx_product_prospects_prospect
+        ON product_prospects(prospect_id);
+    """,
+
+    # ── v14: associate campaigns with products ──
+    """
+    ALTER TABLE campaigns ADD COLUMN product_id TEXT DEFAULT '';
+    """,
 ]
 
-BRAIN_PROVIDERS = ("claude", "codex")
-_USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
-
+BRAIN_PROVIDERS = ("claude", "codex", "ollama")
+_USAGE_LOG_COLUMN = {
+    "claude": "claude_calls",
+    "codex": "codex_calls",
+    "ollama": "ollama_calls",
+}
 # When a company was last profiled: the newer of the explicit check stamp
 # (set on every attempt, reachable or not) and its latest profile observation
 # (written by any path, including ones that never stamp the column).
@@ -435,6 +493,7 @@ _LAST_PROFILED = (
 _CAMPAIGN_COLUMNS = frozenset({
     "name", "channel", "instantly_campaign_id",
     "sequence_json", "prospect_ids_json", "status",
+    "product_id",
 })
 _CONVERSATION_COLUMNS = frozenset({
     "prospect_id", "campaign_id", "channel",
@@ -476,8 +535,241 @@ class StateManager:
                     await db.executescript(script)
                     await db.execute(f"PRAGMA user_version = {target}")
                     await db.commit()
+    # â”€â”€ Products â”€â”€
 
-    # ── Companies ──
+    @staticmethod
+    def _product_from_row(row: aiosqlite.Row) -> Product:
+        """Convert a database row into a Product model."""
+        d = dict(row)
+
+        for column, field, default in (
+            ("key_benefits_json", "key_benefits", []),
+            ("objection_responses_json", "objection_responses", {}),
+            ("offer_json", "offer", {}),
+            ("icp_json", "icp", {}),
+            ("qualification_rules_json", "qualification_rules", {}),
+        ):
+            raw = d.pop(column, None)
+            try:
+                parsed = json.loads(raw) if raw else default
+            except (json.JSONDecodeError, TypeError):
+                parsed = default
+            d[field] = parsed if isinstance(parsed, type(default)) else default
+
+        d["is_active"] = bool(d.get("is_active", 1))
+        return Product(**d)
+
+    async def add_product(self, product: Product) -> str:
+        """Insert a new product or update an existing product with the same ID."""
+        if not product.id:
+            product.id = _new_id()
+
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO products (
+                    id, name, description, pricing,
+                    key_benefits_json, objection_responses_json,
+                    offer_json, icp_json, business_context,
+                    qualification_rules_json, sales_context, is_active
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    pricing = excluded.pricing,
+                    key_benefits_json = excluded.key_benefits_json,
+                    objection_responses_json = excluded.objection_responses_json,
+                    offer_json = excluded.offer_json,
+                    icp_json = excluded.icp_json,
+                    business_context = excluded.business_context,
+                    qualification_rules_json = excluded.qualification_rules_json,
+                    sales_context = excluded.sales_context,
+                    is_active = excluded.is_active,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    product.id,
+                    product.name,
+                    product.description,
+                    product.pricing,
+                    json.dumps(product.key_benefits),
+                    json.dumps(product.objection_responses),
+                    json.dumps(product.offer),
+                    json.dumps(getattr(product, "icp", {})),
+                    product.business_context,
+                    json.dumps(getattr(product, "qualification_rules", {})),
+                    product.sales_context,
+                    int(product.is_active),
+                ),
+            )
+            await db.commit()
+
+        return product.id
+
+    async def get_product(self, product_id: str) -> Product | None:
+        """Retrieve one product by ID."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM products WHERE id = ?",
+                (product_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return self._product_from_row(row) if row else None
+
+    async def list_products(
+        self,
+        active_only: bool = False,
+    ) -> list[Product]:
+        """List products, optionally filtering inactive products."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            query = "SELECT * FROM products"
+            if active_only:
+                query += " WHERE is_active = 1"
+            query += " ORDER BY created_at DESC"
+
+            async with db.execute(query) as cursor:
+                rows = await cursor.fetchall()
+                return [self._product_from_row(row) for row in rows]
+
+    async def update_product(
+        self,
+        product_id: str,
+        **updates,
+    ) -> bool:
+        """Update allowed product fields. Returns False if product is missing."""
+        allowed = {
+            "name",
+            "description",
+            "pricing",
+            "key_benefits",
+            "objection_responses",
+            "offer",
+            "icp",
+            "business_context",
+            "qualification_rules",
+            "sales_context",
+            "is_active",
+        }
+
+        if not updates:
+            return False
+
+        if not set(updates).issubset(allowed):
+            raise ValueError("Unsupported product field")
+
+        column_map = {
+            "key_benefits": "key_benefits_json",
+            "objection_responses": "objection_responses_json",
+            "offer": "offer_json",
+            "icp": "icp_json",
+            "qualification_rules": "qualification_rules_json",
+        }
+
+        assignments = []
+        values = []
+
+        for field, value in updates.items():
+            column = column_map.get(field, field)
+            if field in column_map:
+                value = json.dumps(value)
+            elif field == "is_active":
+                value = int(value)
+
+            assignments.append(f"{column} = ?")
+            values.append(value)
+
+        assignments.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(product_id)
+
+        async with self._connect() as db:
+            cursor = await db.execute(
+                f"UPDATE products SET {', '.join(assignments)} WHERE id = ?",
+                values,
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+# â”€â”€ Companies â”€â”€
+
+    async def link_product_company(self, product_id: str, company_id: str) -> bool:
+        """Associate an existing company with an existing product."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT 1 FROM products WHERE id = ?", (product_id,)
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return False
+
+            async with db.execute(
+                "SELECT 1 FROM companies WHERE id = ?", (company_id,)
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return False
+
+            cursor = await db.execute(
+                """INSERT OR IGNORE INTO product_companies
+                   (product_id, company_id) VALUES (?, ?)""",
+                (product_id, company_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def link_product_prospect(self, product_id: str, prospect_id: str) -> bool:
+        """Associate an existing prospect with an existing product."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT 1 FROM products WHERE id = ?", (product_id,)
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return False
+
+            async with db.execute(
+                "SELECT 1 FROM prospects WHERE id = ?", (prospect_id,)
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return False
+
+            cursor = await db.execute(
+                """INSERT OR IGNORE INTO product_prospects
+                   (product_id, prospect_id) VALUES (?, ?)""",
+                (product_id, prospect_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_product_companies(self, product_id: str) -> list[Company]:
+        """Return only companies associated with the given product."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT c.*
+                   FROM companies AS c
+                   INNER JOIN product_companies AS pc
+                       ON pc.company_id = c.id
+                   WHERE pc.product_id = ?
+                   ORDER BY c.id""",
+                (product_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [self._company_from_row(row) for row in rows]
+
+    async def get_product_prospects(self, product_id: str) -> list[Prospect]:
+        """Return only prospects associated with the given product."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT p.*
+                   FROM prospects AS p
+                   INNER JOIN product_prospects AS pp
+                       ON pp.prospect_id = p.id
+                   WHERE pp.product_id = ?
+                   ORDER BY p.id""",
+                (product_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [self._prospect_from_row(row) for row in rows]
 
     @staticmethod
     def _company_from_row(row: aiosqlite.Row) -> Company:
@@ -495,7 +787,7 @@ class StateManager:
         """Insert a company, or return the id of the one already recorded.
 
         Identity is the normalised domain when there is one, and the
-        provider's ``external_id`` when there isn't — a business with no
+        provider's ``external_id`` when there isn't â€” a business with no
         website still has to dedup across re-runs, and for anyone selling
         websites those are the best prospects on the list.
         """
@@ -608,7 +900,7 @@ class StateManager:
     async def get_company_by_external_id(self, external_id: str) -> Company | None:
         """Look a company up by its provider-stable id.
 
-        The identity path for businesses with no website — which is exactly
+        The identity path for businesses with no website â€” which is exactly
         the cohort worth the most to anyone selling one.
         """
         if not external_id:
@@ -638,7 +930,7 @@ class StateManager:
             ) as cursor:
                 return bool(await cursor.fetchone())
 
-    # ── Prospects (Contacts) ──
+    # â”€â”€ Prospects (Contacts) â”€â”€
 
     @staticmethod
     def _prospect_from_row(row: aiosqlite.Row) -> Prospect:
@@ -756,7 +1048,7 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Email pattern cache (per-domain) ──
+    # â”€â”€ Email pattern cache (per-domain) â”€â”€
 
     async def get_email_pattern(self, domain: str) -> dict | None:
         async with self._connect() as db:
@@ -810,7 +1102,7 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Outbox (approval ladder + native sending) ──
+    # â”€â”€ Outbox (approval ladder + native sending) â”€â”€
 
     async def add_outbox_item(
         self,
@@ -830,7 +1122,7 @@ class StateManager:
         in_reply_to: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
-        (campaign, prospect, step) slot already exists — the double-send guard."""
+        (campaign, prospect, step) slot already exists â€” the double-send guard."""
         item_id = _new_id()
         async with self._connect() as db:
             cursor = await db.execute(
@@ -847,30 +1139,43 @@ class StateManager:
             )
             await db.commit()
             return item_id if cursor.rowcount > 0 else None
-
     async def get_outbox(
         self,
         status: str | None = None,
         due_before: str | None = None,
         limit: int = 200,
+        product_id: str | None = None,
     ) -> list[dict]:
         where, params = [], []
+
         if status:
-            where.append("status = ?")
+            where.append("o.status = ?")
             params.append(status)
+
         if due_before:
-            where.append("(send_at IS NULL OR send_at <= ?)")
+            where.append("(o.send_at IS NULL OR o.send_at <= ?)")
             params.append(due_before)
-        sql = "SELECT * FROM outbox"
+
+        if product_id is not None:
+            where.append("c.product_id = ?")
+            params.append(product_id)
+
+        sql = """
+            SELECT o.*
+            FROM outbox o
+            LEFT JOIN campaigns c ON c.id = o.campaign_id
+        """
+
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY send_at ASC, created_at ASC LIMIT ?"
+
+        sql += " ORDER BY o.send_at ASC, o.created_at ASC LIMIT ?"
         params.append(int(limit))
+
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(sql, params) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
-
     async def get_outbox_item(self, item_id: str) -> dict | None:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -954,7 +1259,7 @@ class StateManager:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
 
-    # ── Signal vocabulary (governed; user-confirmed before collection) ──
+    # â”€â”€ Signal vocabulary (governed; user-confirmed before collection) â”€â”€
 
     async def upsert_signal_code(
         self,
@@ -1007,7 +1312,7 @@ class StateManager:
 
     async def set_signal_status(self, code: str, status: str) -> bool:
         """Confirm / reject a proposed signal. Only confirmed signals are
-        collected — Harvey proposes, the user decides."""
+        collected â€” Harvey proposes, the user decides."""
         if status not in ("proposed", "confirmed", "rejected"):
             raise ValueError(f"invalid signal status: {status}")
         async with self._connect() as db:
@@ -1022,7 +1327,7 @@ class StateManager:
     async def confirmed_signal_codes(self) -> set[str]:
         return {r["code"] for r in await self.get_signal_codes(status="confirmed")}
 
-    # ── Observations (every fact is a row, never a column) ──
+    # â”€â”€ Observations (every fact is a row, never a column) â”€â”€
 
     async def add_observation(
         self,
@@ -1038,7 +1343,7 @@ class StateManager:
         run_id: str = "",
         observed_at: str | None = None,
     ) -> str:
-        """Record one fact. Raises if signal_code isn't in the vocabulary —
+        """Record one fact. Raises if signal_code isn't in the vocabulary â€”
         a typo must fail loudly rather than create a junk signal."""
         obs_id = _new_id()
         async with self._connect() as db:
@@ -1057,7 +1362,7 @@ class StateManager:
         return obs_id
 
     async def add_observations(self, rows: list[dict], run_id: str = "") -> int:
-        """Batch insert. Flushed per batch by callers — a long run that dies
+        """Batch insert. Flushed per batch by callers â€” a long run that dies
         must not lose everything it observed."""
         if not rows:
             return 0
@@ -1102,7 +1407,7 @@ class StateManager:
         if where:
             sql += " WHERE " + " AND ".join(where)
         if latest_only:
-            # Newest observation per (company, signal) — the current view of
+            # Newest observation per (company, signal) â€” the current view of
             # the world, with history still on disk underneath.
             sql = (
                 "SELECT * FROM (" + sql + " ORDER BY observed_at DESC) "
@@ -1121,11 +1426,11 @@ class StateManager:
     # real finding, and a later flip from 0 to 1 is a real event. But a COHORT
     # asks who *has* the signal, so it must read the value, not merely the
     # presence of a row. Without this, "companies running Google Ads" silently
-    # means "companies we checked for Google Ads" — which is everyone.
+    # means "companies we checked for Google Ads" â€” which is everyone.
     #
     # `latest` is the current view of the world (newest observation per company
     # and signal, with history still on disk underneath). `positive` is the
-    # subset where the finding is actually true — value_num IS NULL covers text
+    # subset where the finding is actually true â€” value_num IS NULL covers text
     # signals like INCUMBENT_AGENCY, where the row's existence IS the finding.
     _CURRENT_CTE = """
     WITH latest AS (
@@ -1142,7 +1447,7 @@ class StateManager:
     """
 
     async def signal_counts(self) -> list[dict]:
-        """How many entities actually carry each signal — the cohort sizes."""
+        """How many entities actually carry each signal â€” the cohort sizes."""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -1168,7 +1473,7 @@ class StateManager:
     ) -> list[str]:
         """Company IDs carrying ALL required signals and none excluded.
 
-        Set intersection happens in SQL — doing it in application code over a
+        Set intersection happens in SQL â€” doing it in application code over a
         capped SELECT silently returns the wrong cohort.
         """
         if not require:
@@ -1200,7 +1505,7 @@ class StateManager:
     ) -> list[dict]:
         """Companies a profile run should visit next.
 
-        Never checked, or last checked longer ago than ``stale_days`` —
+        Never checked, or last checked longer ago than ``stale_days`` â€”
         ordered nulls-first so it rotates through the whole backlog instead
         of retrying the same top-N-by-created_at companies every cycle.
         ``profile_checked_at`` is set on every attempt regardless of outcome
@@ -1208,7 +1513,7 @@ class StateManager:
         checked and rotates out instead of being retried forever. A profile
         observation written any other way still counts too, whichever is newer.
 
-        Businesses with no domain are excluded — there is no site to read.
+        Businesses with no domain are excluded â€” there is no site to read.
         They are not a failure, they are the NO_WEBSITE cohort.
         """
         async with self._connect() as db:
@@ -1241,7 +1546,7 @@ class StateManager:
 
     async def mark_company_profiled(self, company_id: str):
         """Record that a profile pass looked at this company, whether or
-        not it was reachable — advances the rotation regardless."""
+        not it was reachable â€” advances the rotation regardless."""
         async with self._connect() as db:
             await db.execute(
                 """UPDATE companies SET profile_checked_at = CURRENT_TIMESTAMP,
@@ -1263,7 +1568,7 @@ class StateManager:
         Ordered by ``prospects_checked_at`` (nulls first) rather than
         recency, so a backfill pass rotates through the whole backlog
         instead of retrying the same top-N-by-created_at companies every
-        cycle — a company a team page didn't exist for last time is worth
+        cycle â€” a company a team page didn't exist for last time is worth
         another look after ``stale_days``, not a permanent skip.
         """
         async with self._connect() as db:
@@ -1285,7 +1590,7 @@ class StateManager:
 
     async def mark_prospects_checked(self, company_id: str):
         """Record that a prospect-backfill pass looked at this company,
-        whether or not it found anyone — advances the rotation regardless."""
+        whether or not it found anyone â€” advances the rotation regardless."""
         async with self._connect() as db:
             await db.execute(
                 """UPDATE companies SET prospects_checked_at = CURRENT_TIMESTAMP,
@@ -1294,7 +1599,7 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Run log (what ran, when, what it produced and cost) ──
+    # â”€â”€ Run log (what ran, when, what it produced and cost) â”€â”€
 
     async def start_run(
         self, stage: str, provider: str = "", params: dict | None = None
@@ -1326,7 +1631,7 @@ class StateManager:
             await db.commit()
 
     async def sweep_stale_runs(self, older_than_hours: int = 6) -> int:
-        """A killed collector can't close its own run — never trust it to."""
+        """A killed collector can't close its own run â€” never trust it to."""
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE runs SET status = 'stale', ended_at = CURRENT_TIMESTAMP "
@@ -1345,7 +1650,7 @@ class StateManager:
             ) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
-    # ── Settings (operational flags: kill switch, counters) ──
+    # â”€â”€ Settings (operational flags: kill switch, counters) â”€â”€
 
     async def get_setting(self, key: str, default: str = "") -> str:
         async with self._connect() as db:
@@ -1413,7 +1718,7 @@ class StateManager:
                 rows = await cursor.fetchall()
                 return {row[0]: row[1] for row in rows}
 
-    # ── Feedback ──
+    # â”€â”€ Feedback â”€â”€
 
     async def add_feedback(
         self, entity_type: str, entity_id: str, comment: str
@@ -1451,7 +1756,7 @@ class StateManager:
                 rows = await cursor.fetchall()
                 return [dict(r) for r in rows]
 
-    # ── Reply Deduplication ──
+    # â”€â”€ Reply Deduplication â”€â”€
 
     async def is_reply_processed(self, reply_id: str) -> bool:
         """Check if a reply has already been processed."""
@@ -1474,7 +1779,7 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Campaigns ──
+    # -- Campaigns --
 
     async def add_campaign(self, campaign: Campaign) -> str:
         if not campaign.id:
@@ -1482,12 +1787,13 @@ class StateManager:
         async with self._connect() as db:
             await db.execute(
                 """INSERT INTO campaigns
-                   (id, name, channel, instantly_campaign_id, sequence_json,
-                    prospect_ids_json, status, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (id, product_id, name, channel, instantly_campaign_id,
+                    sequence_json, prospect_ids_json, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    campaign.id, campaign.name, campaign.channel,
-                    campaign.instantly_campaign_id, campaign.sequence_json(),
+                    campaign.id, campaign.product_id, campaign.name,
+                    campaign.channel, campaign.instantly_campaign_id,
+                    campaign.sequence_json(),
                     json.dumps(campaign.prospect_ids), campaign.status,
                     campaign.created_at.isoformat(),
                 ),
@@ -1525,7 +1831,7 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Conversations ──
+    # â”€â”€ Conversations â”€â”€
 
     async def add_conversation(self, convo: Conversation) -> str:
         if not convo.id:
@@ -1588,7 +1894,7 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Actions Log ──
+    # â”€â”€ Actions Log â”€â”€
 
     async def log_action(self, action_type: str, agent: str, details: dict | None = None):
         async with self._connect() as db:
@@ -1598,7 +1904,7 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Analytics ──
+    # â”€â”€ Analytics â”€â”€
 
     async def get_campaign_stats(self) -> list[dict]:
         """Get performance stats for each campaign (one indexed pass over conversations)."""
@@ -1649,7 +1955,7 @@ class StateManager:
                 rows = await cursor.fetchall()
                 return {row[0]: row[1] for row in rows}
 
-    # ── Usage Tracking ──
+    # â”€â”€ Usage Tracking â”€â”€
 
     async def get_usage_today(self, provider: str = "claude") -> int:
         """Brain calls made today on one provider's subscription."""
@@ -1674,7 +1980,7 @@ class StateManager:
             )
             await db.commit()
 
-    # ── Per-call usage accounting (usage_events) ──
+    # â”€â”€ Per-call usage accounting (usage_events) â”€â”€
 
     async def record_usage_event(
         self,
@@ -1801,7 +2107,7 @@ class StateManager:
                     totals[label] = self._usage_row_to_dict(row) if row else {}
         return totals
 
-    # ── Summary for Decision Making ──
+    # â”€â”€ Summary for Decision Making â”€â”€
 
     async def get_state_summary(self) -> dict:
         prospect_counts = await self.count_prospects_by_status()
@@ -1821,11 +2127,13 @@ class StateManager:
             ) as cursor:
                 open_conversations = (await cursor.fetchone())[0]
             async with db.execute(
-                "SELECT claude_calls, codex_calls FROM usage_log WHERE date = ?", (today,)
+                "SELECT claude_calls, codex_calls, ollama_calls FROM usage_log WHERE date = ?",
+                (today,),
             ) as cursor:
                 usage_row = await cursor.fetchone()
                 usage_today = (usage_row[0] or 0) if usage_row else 0
                 codex_today = (usage_row[1] or 0) if usage_row else 0
+                ollama_today = (usage_row[2] or 0) if usage_row else 0
 
         return {
             "prospects": prospect_counts,
@@ -1833,9 +2141,13 @@ class StateManager:
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
             "usage_today": usage_today,  # Claude calls (kept for compatibility)
-            "usage_today_by_provider": {"claude": usage_today, "codex": codex_today},
+            "usage_today_by_provider": {
+                "claude": usage_today,
+                "codex": codex_today,
+                "ollama": ollama_today,
+            },
             # Companies discovered but not yet read. The heartbeat profiles
-            # these every cycle — it is free, so it never competes with the
+            # these every cycle â€” it is free, so it never competes with the
             # Claude budget the rest of the loop is rationing.
             "unprofiled": await self.count_companies_needing_profile(),
         }

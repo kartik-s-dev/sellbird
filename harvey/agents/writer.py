@@ -1,12 +1,19 @@
+
 """Writer — crafts personalized email sequences.
 
 With a native mail provider (Gmail/SMTP), email 1 is written PER PROSPECT
 from grounded facts — the company's own description, detected tech stack,
 and buying signals — instead of one merge-tag template shared by a whole
-batch. Mass-templated "token-swap" mail is exactly what inbox filters now
-cluster and junk; a specific, verifiable first line is what earns replies.
-Steps 2-3 stay campaign-level (proof point + breakup are less personal by
-design). Every draft still passes the deterministic pre-send gate.
+batch.
+
+Steps 2-3 stay campaign-level. Every draft still passes the deterministic
+pre-send gate.
+
+Product-aware mode:
+- Processes only prospects explicitly linked to the selected product.
+- Stores the product ID on every generated campaign.
+- Uses the product-specific HarveyConfig supplied by the orchestrator.
+- Preserves legacy global behaviour when no product_id is supplied.
 """
 
 import json
@@ -21,8 +28,7 @@ from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.writer")
 
-# Native mode: one Claude call per prospect for email 1, so batches stay
-# small — the rest of the 'new' pool is picked up on later cycles.
+# Native mode: one LLM call per prospect for email 1, so batches stay small.
 NATIVE_BATCH_CAP = 8
 LEGACY_BATCH_CAP = 50
 
@@ -34,44 +40,85 @@ class Writer:
         state: StateManager,
         config: HarveyConfig,
         env=None,
+        product_id: str | None = None,
     ):
         self.brain = brain
         self.state = state
         self.config = config
         self.env = env
+        self.product_id = str(product_id).strip() if product_id else None
+        self.skills = ""
 
     @property
     def is_native(self) -> bool:
         return self.config.channels.email.provider in NATIVE_PROVIDERS
 
+    def _session_id(self, task: str) -> str:
+        """Keep product-specific LLM sessions separate."""
+        if self.product_id:
+            return f"harvey-writer-{self.product_id}-{task}"
+        return f"harvey-writer-{task}"
+
+    async def _get_new_prospects(self) -> list:
+        """Fetch only eligible prospects for this Writer instance."""
+        if self.product_id:
+            linked_prospects = await self.state.get_product_prospects(
+                self.product_id
+            )
+            prospects = [
+                prospect
+                for prospect in linked_prospects
+                if prospect.status == "new"
+            ]
+            logger.info(
+                "Writer: Product mode enabled for %s; found %d new linked prospect(s).",
+                self.product_id,
+                len(prospects),
+            )
+        else:
+            # Preserve existing global behaviour.
+            prospects = await self.state.get_prospects_by_status("new")
+
+        # Protect against accidental duplicate associations.
+        unique = {}
+        for prospect in prospects:
+            if prospect.id:
+                unique[prospect.id] = prospect
+
+        return list(unique.values())
+
     async def run(self):
         """Create email campaigns for prospects that need outreach."""
         logger.info("Writer: Crafting email campaigns...")
 
-        # Load foundational skills for this agent
-        self.skills = self.brain.load_skills_for_agent("writer")
+        self.skills = self.brain.load_skills_for_agent("writer") or ""
 
-        # Get prospects that haven't been contacted yet
-        new_prospects = await self.state.get_prospects_by_status("new")
+        try:
+            new_prospects = await self._get_new_prospects()
+        except Exception:
+            logger.exception("Writer: Failed to retrieve prospects.")
+            return
+
         if not new_prospects:
             logger.info("Writer: No new prospects to write for.")
             return
 
-        # Only write for prospects we can actually deliver to. Guessed and
-        # invalid addresses are skipped so we don't spend Claude calls (or
-        # sending reputation) on mail that will bounce.
+        # Do not spend LLM calls or sending reputation on guessed/invalid
+        # email addresses.
         deliverable = {"verified", "risky"}
         prospects_with_email = [
-            p for p in new_prospects
-            if p.email and (p.email_status or "guess") in deliverable
+            prospect
+            for prospect in new_prospects
+            if prospect.email
+            and (prospect.email_status or "guess") in deliverable
         ]
+
         if not prospects_with_email:
             logger.info(
                 "Writer: No prospects with deliverable (verified/risky) emails yet."
             )
             return
 
-        # Batch prospects into campaign groups (by industry/title for relevance)
         batches = self._group_prospects(prospects_with_email)
 
         for batch_name, prospects in batches.items():
@@ -79,59 +126,103 @@ class Writer:
                 continue
 
             logger.info(
-                f"Writer: Creating campaign '{batch_name}' for "
-                f"{len(prospects)} prospects."
+                "Writer: Creating campaign '%s' for %d prospects.",
+                batch_name,
+                len(prospects),
             )
 
-            # Generate the email sequence
-            sequence = await self._write_sequence(prospects)
-            if not sequence:
-                logger.warning(f"Writer: Failed to generate sequence for {batch_name}")
+            try:
+                sequence = await self._write_sequence(prospects)
+            except Exception:
+                logger.exception(
+                    "Writer: Sequence generation failed for %s.", batch_name
+                )
                 continue
 
-            # Create the campaign
+            if not sequence:
+                logger.warning(
+                    "Writer: Failed to generate sequence for %s.", batch_name
+                )
+                continue
+
             campaign = Campaign(
                 id="",
                 name=batch_name,
                 channel="email",
                 sequence=sequence,
-                prospect_ids=[p.id for p in prospects],
+                prospect_ids=[prospect.id for prospect in prospects],
                 status="draft",
+                product_id=self.product_id or "",
             )
-            campaign_id = await self.state.add_campaign(campaign)
 
-            # Mark prospects so they aren't picked up again
-            for p in prospects:
-                await self.state.update_prospect_status(p.id, "queued")
+            try:
+                campaign_id = await self.state.add_campaign(campaign)
+            except Exception:
+                logger.exception(
+                    "Writer: Failed to save campaign %s.", batch_name
+                )
+                continue
 
-            # Native providers: replace the shared template for email 1 with
-            # a per-prospect draft grounded in that company's actual facts.
+            if not campaign_id:
+                logger.error(
+                    "Writer: Campaign %s was not saved; prospects remain unchanged.",
+                    batch_name,
+                )
+                continue
+
+            # Mark prospects only after campaign creation succeeds.
+            for prospect in prospects:
+                try:
+                    await self.state.update_prospect_status(
+                        prospect.id, "queued"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Writer: Could not queue prospect %s.",
+                        prospect.id,
+                    )
+
+            # Native providers get individually grounded first-touch drafts.
             if self.is_native:
-                await self._personalize_first_emails(campaign_id, prospects)
+                try:
+                    await self._personalize_first_emails(
+                        campaign_id, prospects
+                    )
+                except Exception:
+                    logger.exception(
+                        "Writer: Personalization failed for campaign %s.",
+                        campaign_id,
+                    )
 
-            await self.state.log_action(
-                action_type="write_campaign",
-                agent="writer",
-                details={
-                    "campaign_id": campaign_id,
-                    "campaign_name": batch_name,
-                    "prospect_count": len(prospects),
-                    "steps": len(sequence),
-                },
-            )
+            try:
+                await self.state.log_action(
+                    action_type="write_campaign",
+                    agent="writer",
+                    details={
+                        "campaign_id": campaign_id,
+                        "campaign_name": batch_name,
+                        "product_id": self.product_id or "",
+                        "prospect_count": len(prospects),
+                        "steps": len(sequence),
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Writer: Failed to log campaign creation %s.",
+                    campaign_id,
+                )
+
             logger.info(
-                f"Writer: Campaign '{batch_name}' created with "
-                f"{len(sequence)} emails for {len(prospects)} prospects."
+                "Writer: Campaign '%s' created with %d emails for %d prospects.",
+                batch_name,
+                len(sequence),
+                len(prospects),
             )
 
-    async def _personalize_first_emails(self, campaign_id: str, prospects: list):
-        """Draft a grounded, per-prospect email 1 and stage it in the outbox.
-
-        The outbox unique index means the sender's later template staging
-        can't overwrite these rows — a personalized draft always wins the
-        (campaign, prospect, step 1) slot. If a draft fails, the slot stays
-        empty and the sender falls back to the campaign template.
-        """
+    async def _personalize_first_emails(
+        self, campaign_id: str, prospects: list
+    ):
+        """Draft grounded, per-prospect email 1 and stage it in the outbox."""
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
@@ -140,41 +231,57 @@ class Writer:
         provider = self.config.channels.email.provider
 
         drafted = 0
+
         for prospect in prospects:
             try:
                 draft = await self._write_personal_email(prospect)
-            except Exception as e:
-                logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
+            except Exception:
+                logger.exception(
+                    "Writer: Personal draft failed for prospect %s.",
+                    prospect.id,
+                )
                 continue
+
             if not draft:
                 continue
-            item_id = await self.state.add_outbox_item(
-                prospect_id=prospect.id,
-                campaign_id=campaign_id,
-                step=1,
-                to_email=prospect.email,
-                subject=draft["subject"],
-                body=draft["body"],
-                send_at=now,
-                status=status,
-                provider=provider,
-            )
+
+            try:
+                item_id = await self.state.add_outbox_item(
+                    prospect_id=prospect.id,
+                    campaign_id=campaign_id,
+                    step=1,
+                    to_email=prospect.email,
+                    subject=draft["subject"],
+                    body=draft["body"],
+                    send_at=now,
+                    status=status,
+                    provider=provider,
+                )
+            except Exception:
+                logger.exception(
+                    "Writer: Could not stage personal draft for prospect %s.",
+                    prospect.id,
+                )
+                continue
+
             if item_id:
                 drafted += 1
 
         if drafted:
             logger.info(
-                f"Writer: drafted {drafted} personalized first email(s) "
-                f"({'awaiting approval' if require_approval else 'approved'})."
+                "Writer: Drafted %d personalized first email(s) (%s).",
+                drafted,
+                "awaiting approval" if require_approval else "approved",
             )
 
     async def _write_personal_email(self, prospect) -> dict | None:
-        """One grounded draft for one person. Facts in, one email out."""
+        """Generate one grounded first-touch email for one prospect."""
         facts = [
             f"- Name: {prospect.full_name()}",
             f"- Title: {prospect.title}",
             f"- Company: {prospect.company}",
         ]
+
         if prospect.industry:
             facts.append(f"- Industry: {prospect.industry}")
 
@@ -183,30 +290,52 @@ class Writer:
             try:
                 company = await self.state.get_company(prospect.company_id)
             except Exception:
-                company = None
+                logger.warning(
+                    "Writer: Could not load company facts for prospect %s.",
+                    prospect.id,
+                )
+
         if company:
             if company.description:
-                facts.append(f"- What the company says about itself: {company.description}")
-            if company.tech_stack:
-                facts.append(f"- Tools detected on their website: {', '.join(company.tech_stack[:6])}")
-            for signal in company.signals[:3]:
                 facts.append(
-                    f"- Signal ({signal.get('type', 'signal')}): {signal.get('detail', '')}"
+                    f"- What the company says about itself: {company.description}"
                 )
+
+            if company.tech_stack:
+                tools = ", ".join(company.tech_stack[:6])
+                facts.append(f"- Tools detected on their website: {tools}")
+
+            for signal in (company.signals or [])[:3]:
+                if not isinstance(signal, dict):
+                    continue
+                facts.append(
+                    f"- Signal ({signal.get('type', 'signal')}): "
+                    f"{signal.get('detail', '')}"
+                )
+
         if prospect.personalization_notes:
-            facts.append(f"- Research notes: {prospect.personalization_notes}")
+            facts.append(
+                f"- Research notes: {prospect.personalization_notes}"
+            )
+
+        product = self.config.product
+        persona = self.config.persona
+        benefits = product.key_benefits or []
 
         prompt = self.brain.load_prompt(
             "writer",
-            product_name=self.config.product.name,
-            product_description=self.config.product.description,
-            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
-            product_pricing=self.config.product.pricing,
-            persona_name=self.config.persona.name,
-            persona_company=self.config.persona.company,
-            persona_role=self.config.persona.role,
-            persona_tone=self.config.persona.tone,
+            product_name=product.name,
+            product_description=product.description,
+            product_benefits="\n".join(
+                f"- {benefit}" for benefit in benefits
+            ),
+            product_pricing=product.pricing,
+            persona_name=persona.name,
+            persona_company=persona.company,
+            persona_role=persona.role,
+            persona_tone=persona.tone,
         ) or ""
+
         if self.skills:
             prompt += "\n\n" + self.skills
 
@@ -214,64 +343,90 @@ class Writer:
 
 Write ONE cold email (the very first touch) to this specific person.
 
-FACTS — everything you know about them. Every claim about the prospect in
-your email must come from these facts. If a fact isn't listed here, you
-don't know it — do not invent funding rounds, mutual contacts, metrics,
-or anything else:
+FACTS — everything known about this person and company. Every claim about
+the prospect in your email must come from these facts. If a fact isn't
+listed here, you don't know it. Do not invent funding rounds, mutual
+contacts, metrics, achievements, or any other details.
+
 {chr(10).join(facts)}
 
 Requirements:
-- Under 75 words. One specific observation from the FACTS above, one
-  question. No pitch, no product name.
-- Write the actual text (no merge variables — you know their name/company).
+- Under 75 words.
+- One specific observation supported by the FACTS above.
+- Ask one relevant question.
+- No pitch and no product name.
+- Use the person's actual name and company, not merge variables.
 - Subject: lowercase, 2-5 words.
 - Follow every STRICT EMAIL RULE above.
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
         result = await self.brain.think_json(
-            prompt, session_id="harvey-writer",
-            agent="writer", task="personal_email",
+            prompt,
+            session_id=self._session_id("personal"),
+            agent="writer",
+            task="personal_email",
         )
+
         if not isinstance(result, dict):
             return None
-        subject = str(result.get("subject") or "").strip()
-        body = str(result.get("body") or "").strip()
+
+        subject = result.get("subject")
+        body = result.get("body")
+
+        if not isinstance(subject, str) or not isinstance(body, str):
+            return None
+
+        subject = subject.strip()
+        body = body.strip()
+
         if not subject or not body:
             return None
-        return {"subject": subject[:120], "body": body[:2000]}
+
+        return {
+            "subject": subject[:120],
+            "body": body[:2000],
+        }
 
     async def _write_sequence(self, prospects: list) -> list[EmailStep]:
-        """Ask the brain to write a 3-email sequence."""
-        # Build context about the prospects
+        """Generate a three-email campaign sequence."""
         prospect_summary = "\n".join(
-            f"- {p.full_name()}, {p.title} at {p.company}"
-            + (f" | Notes: {p.personalization_notes}" if p.personalization_notes else "")
-            for p in prospects[:5]  # Show sample for context
+            f"- {prospect.full_name()}, {prospect.title} at {prospect.company}"
+            + (
+                f" | Notes: {prospect.personalization_notes}"
+                if prospect.personalization_notes
+                else ""
+            )
+            for prospect in prospects[:5]
         )
+
+        product = self.config.product
+        persona = self.config.persona
+        benefits = product.key_benefits or []
 
         prompt = self.brain.load_prompt(
             "writer",
-            product_name=self.config.product.name,
-            product_description=self.config.product.description,
-            product_benefits="\n".join(f"- {b}" for b in self.config.product.key_benefits),
-            product_pricing=self.config.product.pricing,
-            persona_name=self.config.persona.name,
-            persona_company=self.config.persona.company,
-            persona_role=self.config.persona.role,
-            persona_tone=self.config.persona.tone,
+            product_name=product.name,
+            product_description=product.description,
+            product_benefits="\n".join(
+                f"- {benefit}" for benefit in benefits
+            ),
+            product_pricing=product.pricing,
+            persona_name=persona.name,
+            persona_company=persona.company,
+            persona_role=persona.role,
+            persona_tone=persona.tone,
         )
 
         if not prompt:
-            prompt = f"""You are {self.config.persona.name}, {self.config.persona.role} at {self.config.persona.company}.
-Your tone is: {self.config.persona.tone}
+            prompt = f"""You are {persona.name}, {persona.role} at {persona.company}.
+Your tone is: {persona.tone}
 
-Product: {self.config.product.name}
-Description: {self.config.product.description}
-Key benefits: {', '.join(self.config.product.key_benefits)}
-Pricing: {self.config.product.pricing}"""
+Product: {product.name}
+Description: {product.description}
+Key benefits: {', '.join(benefits)}
+Pricing: {product.pricing}"""
 
-        # Inject email framework skills
         if self.skills:
             prompt += "\n\n" + self.skills
 
@@ -282,11 +437,13 @@ Write a 3-email cold outreach sequence for prospects like these:
 
 Requirements:
 - Email 1: Personalized cold observation + one question. Under 75 words. No pitch.
-- Email 2: Follow-up 3 days later. Different angle, one concrete proof point. Under 75 words.
+- Email 2: Follow-up 3 days later. Different angle, one concrete proof point.
+  Under 75 words. Do not invent proof points; use only supplied product facts.
 - Email 3: Break-up email 4 days after that. Under 40 words. Gracious, not guilt-tripping.
-- Use {{{{first_name}}}}, {{{{company}}}}, {{{{title}}}} as merge variables — every email
-  must use at least one, and email 1 must reference something specific to
-  these prospects' industry or role (use the notes above).
+- Use {{{{first_name}}}}, {{{{company}}}}, {{{{title}}}} as merge variables.
+  Every email must use at least one.
+- Email 1 must reference a relevant industry or role detail from the prospect context.
+- Never invent prospect facts, customer results, metrics, testimonials, or proof.
 - Never be pushy or salesy. Be consultative and value-driven.
 - Subject lines: lowercase, 2-5 words.
 - Follow every rule in the STRICT EMAIL RULES above. No exceptions.
@@ -299,76 +456,107 @@ Return ONLY a JSON array (no markdown fences, no commentary):
 ]"""
 
         result = await self.brain.think_json(
-            prompt, session_id="harvey-writer",
-            agent="writer", task="write_sequence",
+            prompt,
+            session_id=self._session_id("sequence"),
+            agent="writer",
+            task="write_sequence",
         )
+
         return self._parse_sequence(result)
 
     def _parse_sequence(self, result) -> list[EmailStep]:
-        """Robustly coerce LLM output into a validated EmailStep list.
+        """Coerce LLM output into a validated EmailStep list.
 
-        Never raises. Tolerates a wrapper dict ({"emails": [...]}), missing
-        or wrong-typed fields, and extra keys. Drops invalid steps rather
-        than failing the whole sequence.
+        Never raises. Accepts a direct list or a common wrapper dictionary.
+        Invalid steps are dropped.
         """
         if isinstance(result, dict):
-            # Model wrapped the array in an object — unwrap common keys.
             for key in ("emails", "sequence", "steps", "campaign"):
                 if isinstance(result.get(key), list):
                     result = result[key]
                     break
+
         if not isinstance(result, list) or not result:
-            logger.error(f"Writer: Brain did not return an email array (got {type(result).__name__}).")
+            logger.error(
+                "Writer: Brain did not return an email array (got %s).",
+                type(result).__name__,
+            )
             return []
 
         steps: list[EmailStep] = []
-        for i, raw in enumerate(result[:5]):  # never accept absurdly long sequences
+
+        for index, raw in enumerate(result[:5]):
             if not isinstance(raw, dict):
-                logger.warning(f"Writer: Skipping non-dict step at index {i}.")
+                logger.warning(
+                    "Writer: Skipping non-dict step at index %d.", index
+                )
                 continue
-            subject = str(raw.get("subject") or "").strip()
-            body = str(raw.get("body") or "").strip()
+
+            subject = raw.get("subject")
+            body = raw.get("body")
+
+            if not isinstance(subject, str) or not isinstance(body, str):
+                logger.warning(
+                    "Writer: Skipping step %d with invalid subject/body types.",
+                    index + 1,
+                )
+                continue
+
+            subject = subject.strip()
+            body = body.strip()
+
             if not subject or not body:
-                logger.warning(f"Writer: Skipping step {i + 1} with empty subject/body.")
+                logger.warning(
+                    "Writer: Skipping step %d with empty subject/body.",
+                    index + 1,
+                )
                 continue
+
             try:
-                delay = max(0, int(raw.get("delay_days", 3 if steps else 0)))
-            except (TypeError, ValueError):
+                delay = max(
+                    0, int(raw.get("delay_days", 3 if steps else 0))
+                )
+            except (TypeError, ValueError, OverflowError):
                 delay = 3 if steps else 0
+
             try:
                 steps.append(
                     EmailStep(
                         step=len(steps) + 1,
-                        subject=subject,
-                        body=body,
+                        subject=subject[:200],
+                        body=body[:10000],
                         delay_days=delay,
                     )
                 )
-            except Exception as e:
-                logger.warning(f"Writer: Skipping invalid step {i + 1}: {e}")
+            except Exception:
+                logger.exception(
+                    "Writer: Skipping invalid step %d.", index + 1
+                )
 
         if steps and steps[0].delay_days != 0:
-            steps[0].delay_days = 0  # first email always sends immediately
+            steps[0].delay_days = 0
 
-        if len(steps) < 3:
-            logger.warning(f"Writer: Expected 3 emails, got {len(steps)}.")
+        if len(steps) != 3:
+            logger.warning(
+                "Writer: Expected 3 emails, got %d.", len(steps)
+            )
+
         return steps
 
     def _group_prospects(self, prospects: list) -> dict[str, list]:
-        """Group prospects into campaign batches by industry/title combo."""
+        """Group prospects into bounded campaign batches by industry."""
         batches: dict[str, list] = {}
 
         for prospect in prospects:
-            # Group by industry + rough title category
             industry = prospect.industry or "general"
             key = f"{industry}-outreach"
+            batches.setdefault(key, []).append(prospect)
 
-            if key not in batches:
-                batches[key] = []
-            batches[key].append(prospect)
-
-        # Cap batch size. Native mode stays small because email 1 is drafted
-        # per prospect (one Claude call each); leftovers ride the next cycle.
-        # Small segments also outperform blasts on deliverability.
         cap = NATIVE_BATCH_CAP if self.is_native else LEGACY_BATCH_CAP
-        return {key: group[:cap] for key, group in batches.items()}
+
+        # Only the first batch-sized group is returned. Remaining prospects
+        # retain their "new" status and can be processed in a later cycle.
+        return {
+            key: group[:cap]
+            for key, group in batches.items()
+        }

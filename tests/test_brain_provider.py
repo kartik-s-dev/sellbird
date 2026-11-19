@@ -60,7 +60,10 @@ def test_brain_config_validation():
         with pytest.raises(ValidationError):
             BrainConfig(**bad)
 
-
+def test_ollama_brain_config_validation():
+    cfg = BrainConfig(provider=" Ollama ", model="phi3:latest")
+    assert cfg.provider == "ollama"
+    assert cfg.model == "phi3:latest"
 def test_load_brain_config(tmp_path):
     path = tmp_path / "harvey.yaml"
     assert load_brain_config(str(path)) == BrainConfig()  # missing file
@@ -230,6 +233,48 @@ async def test_claude_preflight_is_a_no_op(state, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ollama_preflight_requires_configured_model(state):
+    brain = Brain(state, BrainConfig(provider="ollama"))
+    assert "No local Ollama model is configured" in await brain.preflight()
+
+
+@pytest.mark.asyncio
+async def test_ollama_preflight_reports_server_unavailable(state, monkeypatch):
+    from harvey.ollama_client import OllamaError
+
+    brain = Brain(state, BrainConfig(provider="ollama", model="phi3:latest"))
+
+    async def unavailable():
+        raise OllamaError("Ollama server unavailable")
+
+    monkeypatch.setattr(brain.ollama, "list_models", unavailable)
+    assert await brain.preflight() == "Ollama server unavailable"
+
+
+@pytest.mark.asyncio
+async def test_ollama_preflight_reports_missing_model(state, monkeypatch):
+    brain = Brain(state, BrainConfig(provider="ollama", model="phi3:latest"))
+
+    async def available_models():
+        return {"llama3.1:8b"}
+
+    monkeypatch.setattr(brain.ollama, "list_models", available_models)
+    assert "phi3:latest" in await brain.preflight()
+    assert "not installed" in await brain.preflight()
+
+
+@pytest.mark.asyncio
+async def test_ollama_preflight_succeeds_when_model_is_installed(state, monkeypatch):
+    brain = Brain(state, BrainConfig(provider="ollama", model="phi3:latest"))
+
+    async def available_models():
+        return {"phi3:latest"}
+
+    monkeypatch.setattr(brain.ollama, "list_models", available_models)
+    assert await brain.preflight() == ""
+
+
+@pytest.mark.asyncio
 async def test_codex_pause_is_sticky_until_the_login_or_cli_changes(state):
     import json
     brain = _codex_brain(state, [])
@@ -366,7 +411,7 @@ async def test_existing_usage_rows_become_claude(tmp_path):
     assert await sm.get_usage_today("codex") == 0
     summary = await sm.get_state_summary()
     assert summary["usage_today"] == 7
-    assert summary["usage_today_by_provider"] == {"claude": 7, "codex": 0}
+    assert summary["usage_today_by_provider"] == {"claude": 7, "codex": 0, "ollama": 0}
     with pytest.raises(ValueError):
         await sm.record_usage_event(provider="gemini")
 
@@ -744,3 +789,90 @@ def test_cli_status_hides_another_providers_pause(monkeypatch, tmp_path, capsys)
                       config=BrainConfig(provider="codex", model="gpt-5.5"),
                       setting=_STALE_CODEX_PAUSE)
     assert "Codex PAUSED" in out
+
+
+# ?? Ollama inference and local usage accounting ??
+
+@pytest.mark.asyncio
+async def test_ollama_budget_uses_local_daily_counter(state):
+    brain = Brain(state, BrainConfig(provider="ollama", model="phi3:latest"))
+
+    assert brain.quota is None
+    assert await brain.is_within_budget(1, max_percent=80) is True
+
+    await state.increment_usage(provider="ollama")
+    assert await brain.is_within_budget(1, max_percent=80) is False
+
+
+@pytest.mark.asyncio
+async def test_ollama_think_records_local_usage_without_cloud_fallback(
+    state, monkeypatch
+):
+    brain = Brain(state, BrainConfig(provider="ollama", model="phi3:latest"))
+
+    class StubOllama:
+        async def chat(self, **kwargs):
+            assert kwargs["model"] == "phi3:latest"
+            assert kwargs["prompt"] == "Write a sales email"
+            return {
+                "text": "Hello, here is a product introduction.",
+                "model": "phi3:latest",
+                "input_tokens": 12,
+                "output_tokens": 9,
+                "duration_ms": 450,
+            }
+
+    async def no_subprocess(*args, **kwargs):
+        raise AssertionError("Ollama must not fall back to a cloud CLI")
+
+    monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", no_subprocess)
+    brain.ollama = StubOllama()
+
+    result = await brain.think(
+        "Write a sales email", session_id="ollama-test",
+        agent="writer", task="email",
+    )
+
+    assert result == "Hello, here is a product introduction."
+    assert await state.get_usage_today("ollama") == 1
+    assert await state.get_usage_today("claude") == 0
+    assert await state.get_usage_today("codex") == 0
+
+    rows = await state.usage_by_provider(days=1)
+    assert [row["provider"] for row in rows] == ["ollama"]
+
+
+@pytest.mark.asyncio
+async def test_ollama_retries_then_returns_empty_on_failure(state, monkeypatch):
+    from harvey.ollama_client import OllamaError
+
+    monkeypatch.setattr(brain_mod, "RETRY_BASE_DELAY", 0)
+    brain = Brain(state, BrainConfig(provider="ollama", model="phi3:latest"))
+
+    class FailingOllama:
+        calls = 0
+
+        async def chat(self, **kwargs):
+            self.calls += 1
+            raise OllamaError("Local model request failed")
+
+    stub = FailingOllama()
+    brain.ollama = stub
+
+    assert await brain.think("hello", max_retries=2) == ""
+    assert stub.calls == 3
+    assert await state.get_usage_today("ollama") == 0
+
+
+@pytest.mark.asyncio
+async def test_ollama_cancellation_propagates(state):
+    brain = Brain(state, BrainConfig(provider="ollama", model="phi3:latest"))
+
+    class CancelledOllama:
+        async def chat(self, **kwargs):
+            raise asyncio.CancelledError()
+
+    brain.ollama = CancelledOllama()
+
+    with pytest.raises(asyncio.CancelledError):
+        await brain.think("hello")

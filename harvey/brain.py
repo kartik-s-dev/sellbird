@@ -39,7 +39,7 @@ _NON_RETRYABLE_PATTERNS = (
 )
 
 
-PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex", "ollama": "Ollama"}
 
 # Settings key holding the brain's last health transition, for `harvey
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
@@ -88,7 +88,8 @@ class Brain:
         self.provider = self.config.provider
         self.model = self.config.model
         self.codex = None
-        # Codex health (unused for Claude, whose behaviour is unchanged).
+        self.ollama = None
+        # Provider health and usage-pause state.
         self.unavailable = ""
         self._unavailable_at = 0.0
         self._unavailable_fingerprint = None
@@ -101,6 +102,10 @@ class Brain:
                 model=self.model, reasoning_effort=self.config.reasoning_effort
             )
             self.quota = CodexQuotaClient(self.codex)
+        elif self.provider == "ollama":
+            from harvey.ollama_client import OllamaClient
+            self.ollama = OllamaClient()
+            self.quota = None
         else:
             # Lazy import avoids a cycle (quota -> usage -> state).
             from harvey.integrations.quota import QuotaClient
@@ -133,6 +138,31 @@ class Brain:
         PROVIDER_RECHECK_SECONDS, so a persistent problem doesn't start
         runtimes every heartbeat.
         """
+        if self.provider == "ollama":
+            from harvey.ollama_client import OllamaError
+
+            if not self.model:
+                return (
+                    "No local Ollama model is configured. "
+                    "Set brain.model in harvey.yaml."
+                )
+            try:
+                models = await self.ollama.list_models()
+            except OllamaError as e:
+                return str(e)
+            except Exception as e:
+                logger.error(
+                    f"Ollama preflight failed unexpectedly ({type(e).__name__})."
+                )
+                return "Ollama preflight failed unexpectedly."
+
+            if self.model not in models:
+                return (
+                    f"Ollama model '{self.model}' is not installed. "
+                    "Check the model name with 'ollama list'."
+                )
+            return ""
+
         if self.provider != "codex":
             return ""
         from harvey.codex import CodexError
@@ -237,6 +267,12 @@ class Brain:
         ``agent``/``task`` label the call in the usage_events ledger so the
         dashboard can attribute tokens and cost to specific work.
         """
+        if self.provider == "ollama":
+            return await self._think_ollama(
+                prompt, session_id=session_id, timeout=timeout,
+                max_retries=max_retries, agent=agent, task=task,
+            )
+
         if self.provider == "codex":
             return await self._think_codex(
                 prompt, session_id=session_id, timeout=timeout,
@@ -366,6 +402,80 @@ class Brain:
         logger.error(
             f"Brain call failed after {max_retries + 1} attempts. "
             f"Last error: {str(last_error)[:200]}"
+        )
+        return ""
+
+    async def _think_ollama(
+        self,
+        prompt: str,
+        session_id: str | None,
+        timeout: float,
+        max_retries: int,
+        agent: str,
+        task: str,
+    ) -> str:
+        """Run local Ollama inference with bounded retries and local usage tracking."""
+        from harvey.ollama_client import OllamaError
+
+        if not self.model:
+            logger.error("Ollama call skipped: no local model configured.")
+            return ""
+
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.info(
+                    f"Retrying Ollama call in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{max_retries + 1})..."
+                )
+                await asyncio.sleep(delay)
+
+            try:
+                result = await self.ollama.chat(
+                    model=self.model,
+                    prompt=prompt,
+                    timeout=timeout,
+                )
+            except OllamaError as e:
+                last_error = str(e)
+                logger.warning(
+                    f"Local Ollama call failed (attempt {attempt + 1}): {e}"
+                )
+                continue
+            except Exception as e:
+                logger.error(
+                    f"Ollama call failed unexpectedly ({type(e).__name__})."
+                )
+                return ""
+
+            try:
+                await self.state.increment_usage(provider="ollama")
+            except Exception as e:
+                logger.warning(f"Failed to record Ollama usage counter: {e}")
+
+            try:
+                await self.state.record_usage_event(
+                    agent=agent,
+                    task=task or session_id or "",
+                    session_id=session_id or "",
+                    model=result["model"],
+                    input_tokens=result["input_tokens"],
+                    output_tokens=result["output_tokens"],
+                    duration_ms=result["duration_ms"],
+                    num_turns=1,
+                    cost_usd=0.0,
+                    source="ollama_local",
+                    provider="ollama",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to record Ollama usage event: {e}")
+
+            return result["text"]
+
+        logger.error(
+            f"Ollama call failed after {max_retries + 1} attempts. "
+            f"Last error: {last_error[:200]}"
         )
         return ""
 
@@ -598,6 +708,12 @@ class Brain:
         user's own interactive work. Fallback when those are unavailable:
         Harvey's own call counter for this provider against max_daily_calls.
         """
+        # Local Ollama inference has no Claude/Codex subscription quota.
+        # Enforce only Harvey's local daily call limit.
+        if self.provider == "ollama":
+            calls = await self.check_usage()
+            return calls < max_daily_calls
+
         await self._expire_usage_pause()
         if time.monotonic() < self._usage_limited_until:
             # Codex said the plan is out of usage: an unreadable quota must

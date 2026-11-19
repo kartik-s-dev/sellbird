@@ -5,6 +5,7 @@ Falls back to manual scraping if no Cloudflare credentials are configured.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
@@ -19,6 +20,7 @@ from dotenv import load_dotenv
 from harvey.brain import Brain
 from harvey.config import BrainConfig, load_brain_config
 from harvey.state import StateManager
+from harvey.models.product import Product
 
 logger = logging.getLogger("harvey.trainer")
 
@@ -31,6 +33,15 @@ def _normalize_start_url(url: str) -> str:
     if url and not urlparse(url).scheme:
         url = f"https://{url}"
     return url
+
+
+def _generate_product_id(domain: str, product_name: str) -> str:
+    """Generate a stable ID for a product within a company domain."""
+    normalized_domain = domain.lower().removeprefix("www.").strip()
+    normalized_name = product_name.strip().lower()
+    identity = f"{normalized_domain}:{normalized_name}"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return f"prod_{digest}"
 
 # Fallback: pages to try if Cloudflare crawl is unavailable
 FALLBACK_PATHS = [
@@ -329,6 +340,53 @@ class Trainer:
         self.brain = Brain(self.state, self.brain_config)
         self.scraped_pages: dict[str, str] = {}
 
+    async def _save_product(
+        self,
+        domain: str,
+        product_info: dict,
+        icp_info: dict,
+        objections: dict,
+    ) -> str:
+        """Persist one independently configured product in SQLite."""
+        product_name = str(product_info.get("product_name") or "").strip()
+        if not product_name:
+            raise ValueError("Cannot save product: extracted product name is empty.")
+
+        product = Product(
+            id=_generate_product_id(domain, product_name),
+            name=product_name,
+            description=str(product_info.get("product_description") or ""),
+            pricing=str(product_info.get("pricing") or ""),
+            key_benefits=[
+                item for item in product_info.get("key_benefits", [])
+                if isinstance(item, str) and item.strip()
+            ],
+            objection_responses={
+                key: value
+                for key, value in objections.items()
+                if isinstance(key, str) and isinstance(value, str)
+            },
+            offer={
+                "value_proposition": product_info.get("value_proposition", ""),
+                "features": product_info.get("features", []),
+                "differentiators": product_info.get("differentiators", []),
+                "use_cases": product_info.get("use_cases", []),
+            },
+            icp=icp_info,
+            business_context=(
+                f"Company: {product_info.get('company_name', '')}\n"
+                f"Website: {domain}\n"
+                f"Target audience: {product_info.get('target_audience', '')}"
+            ),
+            qualification_rules={},
+            sales_context=(
+                f"Brand tone: {product_info.get('tone', '')}\n"
+                f"Social proof: {product_info.get('social_proof', [])}\n"
+                f"Integrations: {product_info.get('integrations', [])}"
+            ),
+        )
+        return await self.state.add_product(product)
+
     async def train(
         self,
         url: str,
@@ -408,6 +466,11 @@ class Trainer:
         # Step 6: Generate config + skills
         print("[6/6] Building configuration and product knowledge...")
         config = self._build_config(product_info, icp_info, objections, domain)
+
+        saved_product_id = await self._save_product(
+            domain, product_info, icp_info, objections
+        )
+        print(f"      Saved product to SQLite: {saved_product_id}")
 
         # Write config (relative paths resolve against the project root,
         # so training works no matter what directory it's launched from)
@@ -536,12 +599,8 @@ an extra one costs nothing.
 Be specific — don't guess generically. Base this on what the website actually says about their customers."""
 
         result = await self.brain.think_json(prompt, session_id="harvey-trainer")
-        return result if isinstance(result, dict) else {
-            "industries": ["Technology"],
-            "company_size": "10-200 employees",
-            "titles": ["VP", "Director", "Head of"],
-            "geography": ["United States"],
-        }
+        # Do not invent an ICP when extraction fails.
+        return result if isinstance(result, dict) else {}
 
     async def _extract_competitive_intel(self, product_info: dict) -> dict:
         """Extract competitive positioning and differentiators."""

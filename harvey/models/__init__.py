@@ -3,6 +3,7 @@
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.models.company import Company
 from harvey.models.conversation import Conversation, Message, STAGES
+from harvey.models.product import Product
 from harvey.models.prospect import Prospect
 
 __all__ = [
@@ -11,6 +12,7 @@ __all__ = [
     "Conversation",
     "EmailStep",
     "Message",
+    "Product",
     "Prospect",
     "STAGES",
 ]

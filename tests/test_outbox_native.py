@@ -349,3 +349,97 @@ async def test_inbound_dedup(state):
     await handler._run_native()   # same message again → ignored via dedup
     second = await state.get_conversations_by_status("closed")
     assert len(first) == len(second) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_sender_stages_only_its_product_campaigns(state):
+    from harvey.models.product import Product
+
+    await state.add_product(Product(id="product-a", name="CRM"))
+    await state.add_product(Product(id="product-b", name="Analytics"))
+
+    prospect_a = await seed_prospect(state, email="alice@crm-example.com")
+    prospect_b = await seed_prospect(state, email="bob@analytics-example.com")
+
+    campaign_data = [
+        ("campaign-a", "product-a", prospect_a),
+        ("campaign-b", "product-b", prospect_b),
+    ]
+
+    for campaign_id, product_id, prospect_id in campaign_data:
+        await state.add_campaign(Campaign(
+            id=campaign_id,
+            product_id=product_id,
+            name=campaign_id,
+            sequence=[EmailStep(step=1, subject="Hello", body="Hello {{first_name}}")],
+            prospect_ids=[prospect_id],
+        ))
+
+    sender = make_sender(state, FakeProvider(), require_approval=True)
+    sender.product_id = "product-a"
+
+    await sender._run_native()
+
+    campaigns = await state.get_campaigns_by_status("draft")
+    assert [c.id for c in campaigns] == ["campaign-b"]
+
+    outbox_a = await state.get_outbox(product_id="product-a")
+    outbox_b = await state.get_outbox(product_id="product-b")
+
+    assert len(outbox_a) == 1
+    assert len(outbox_b) == 0
+
+    saved_b = await state.get_prospect(prospect_b)
+    assert saved_b.status == "new"
+
+
+@pytest.mark.asyncio
+async def test_native_sender_drains_only_its_product_outbox(state):
+    from harvey.models.product import Product
+
+    await state.add_product(Product(id="product-a", name="CRM"))
+    await state.add_product(Product(id="product-b", name="Analytics"))
+
+    prospect_a = await seed_prospect(state, email="alice@crm-example.com")
+    prospect_b = await seed_prospect(state, email="bob@analytics-example.com")
+
+    await state.add_campaign(Campaign(
+        id="campaign-a", product_id="product-a", name="CRM campaign",
+        status="active", prospect_ids=[prospect_a],
+    ))
+    await state.add_campaign(Campaign(
+        id="campaign-b", product_id="product-b", name="Analytics campaign",
+        status="active", prospect_ids=[prospect_b],
+    ))
+
+    due = _now_iso()
+    for campaign_id, prospect_id, email in [
+        ("campaign-a", prospect_a, "alice@crm-example.com"),
+        ("campaign-b", prospect_b, "bob@analytics-example.com"),
+    ]:
+        await state.add_outbox_item(
+            campaign_id=campaign_id,
+            prospect_id=prospect_id,
+            to_email=email,
+            subject="Hello",
+            body="Hello there",
+            send_at=due,
+            status="approved",
+            provider="fake",
+        )
+
+    provider = FakeProvider()
+    sender = make_sender(state, provider, require_approval=False)
+    sender.product_id = "product-a"
+
+    await sender._drain_due()
+
+    assert [item["to"] for item in provider.sent] == [
+        "alice@crm-example.com"
+    ]
+
+    remaining_b = await state.get_outbox(
+        status="approved", product_id="product-b"
+    )
+    assert len(remaining_b) == 1
+    assert remaining_b[0]["to_email"] == "bob@analytics-example.com"

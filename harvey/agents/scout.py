@@ -106,11 +106,13 @@ class Scout:
         state: StateManager,
         config: HarveyConfig,
         env: EnvConfig,
+        product_id: str | None = None,
     ):
         self.brain = brain
         self.state = state
         self.config = config
         self.env = env
+        self.product_id = product_id
         self.skills = ""
         self._queries_this_cycle = 0
         # In-memory dedup guards, reset each cycle.
@@ -201,6 +203,15 @@ class Scout:
     def _remember_prospect(self, prospect: Prospect):
         self._seen_prospect_keys.add(self._prospect_key(prospect))
 
+    async def _link_prospect_to_product(self, prospect_id: str) -> None:
+        """Associate a discovered prospect with the selected product."""
+        if not self.product_id:
+            return
+
+        await self.state.link_product_prospect(
+            self.product_id,
+            prospect_id,
+        )
     # ── Central HTTP layer (timeouts, retries, backoff, UA rotation) ──
 
     def _headers(self, extra: dict | None = None) -> dict:
@@ -556,7 +567,9 @@ class Scout:
                 if await self._is_duplicate_prospect(prospect):
                     continue
 
-                await self.state.add_prospect(prospect)
+                prospect_id = await self.state.add_prospect(prospect)
+                if self.product_id:
+                    await self._link_prospect_to_product(prospect_id)
                 self._remember_prospect(prospect)
                 count += 1
                 logger.info(
@@ -620,7 +633,9 @@ class Scout:
                 logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
 
             for prospect in contacts:
-                await self.state.add_prospect(prospect)
+                prospect_id = await self.state.add_prospect(prospect)
+                if self.product_id:
+                    await self._link_prospect_to_product(prospect_id)
                 count += 1
                 logger.info(
                     f"Scout: Added {prospect.full_name()} ({prospect.title}) "
@@ -711,7 +726,9 @@ class Scout:
                         if await self._is_duplicate_prospect(prospect):
                             continue
 
-                        await self.state.add_prospect(prospect)
+                        prospect_id = await self.state.add_prospect(prospect)
+                        if self.product_id:
+                            await self._link_prospect_to_product(prospect_id)
                         self._remember_prospect(prospect)
                         count += 1
                         logger.info(
@@ -775,7 +792,9 @@ class Scout:
                 if await self._is_duplicate_prospect(prospect):
                     continue
 
-                await self.state.add_prospect(prospect)
+                prospect_id = await self.state.add_prospect(prospect)
+                if self.product_id:
+                    await self._link_prospect_to_product(prospect_id)
                 self._remember_prospect(prospect)
                 count += 1
 
@@ -868,7 +887,9 @@ class Scout:
 
         count = 0
         for prospect in scored_contacts:
-            await self.state.add_prospect(prospect)
+            prospect_id = await self.state.add_prospect(prospect)
+            if self.product_id:
+                await self._link_prospect_to_product(prospect_id)
             count += 1
             logger.info(
                 f"Scout: Added {prospect.full_name()} ({prospect.title}) "
@@ -1568,7 +1589,9 @@ Respond ONLY with the JSON array."""
         scored = await self._score_contacts(all_contacts)
         count = 0
         for prospect in scored:
-            await self.state.add_prospect(prospect)
+            prospect_id = await self.state.add_prospect(prospect)
+            if self.product_id:
+                await self._link_prospect_to_product(prospect_id)
             count += 1
             logger.info(
                 f"Scout: Added {prospect.full_name()} ({prospect.title}) "
