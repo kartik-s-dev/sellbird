@@ -481,3 +481,113 @@ async def test_trainer_generates_product_specific_battle_cards(tmp_path, monkeyp
     assert "Competitor X" in content
     assert "Verified strength" in content
     assert "Not established" in content
+
+
+def test_fallback_crawler_stays_inside_product_path():
+    crawler = trainer_module.FallbackCrawler()
+    html = """
+    <a href="/crm/features">Features</a>
+    <a href="/crm/pricing">Pricing</a>
+    <a href="/mail/">Zoho Mail</a>
+    <a href="https://www.zoho.com/crm/integrations">Integrations</a>
+    <a href="https://example.com/crm/">External</a>
+    """
+
+    links = crawler._extract_links(
+        html, "https://www.zoho.com/crm/", "www.zoho.com"
+    )
+
+    assert "https://www.zoho.com/crm/features" in links
+    assert "https://www.zoho.com/crm/pricing" in links
+    assert "https://www.zoho.com/crm/integrations" in links
+    assert not any("/mail/" in link for link in links)
+    assert not any("example.com" in link for link in links)
+
+
+def test_fallback_crawler_root_path_allows_same_domain_links():
+    crawler = trainer_module.FallbackCrawler()
+    html = """
+    <a href="/about">About</a>
+    <a href="/products/crm">Products</a>
+    <a href="https://example.com/about">External</a>
+    """
+
+    links = crawler._extract_links(
+        html, "https://www.example.org/", "www.example.org"
+    )
+
+    assert "https://www.example.org/about" in links
+    assert "https://www.example.org/products/crm" in links
+    assert not any("example.com" in link for link in links)
+
+
+def test_fallback_crawler_rejects_sibling_product_paths():
+    crawler = trainer_module.FallbackCrawler()
+    html = """
+    <a href="/crm/features">CRM</a>
+    <a href="/crmplus/features">CRM Plus</a>
+    <a href="/mail">Mail</a>
+    """
+
+    links = crawler._extract_links(
+        html, "https://www.zoho.com/crm/", "www.zoho.com"
+    )
+
+    assert "https://www.zoho.com/crm/features" in links
+    assert not any("/crmplus/" in link for link in links)
+    assert not any("/mail" in link for link in links)
+
+
+def test_product_identity_requires_source_evidence():
+    from harvey.trainer import _validate_product_identity
+
+    valid, message = _validate_product_identity(
+        {"product_name": "Zoho CRM"},
+        {"https://www.zoho.com/crm/": "Welcome to Zoho CRM"},
+    )
+
+    assert valid is True
+    assert "found" in message.lower()
+
+
+def test_product_identity_rejects_hallucinated_name():
+    from harvey.trainer import _validate_product_identity
+
+    valid, message = _validate_product_identity(
+        {"product_name": "Zoho TouchPoint"},
+        {"https://www.zoho.com/crm/": "Welcome to Zoho CRM"},
+    )
+
+    assert valid is False
+    assert "not found" in message.lower()
+
+
+def test_product_identity_rejects_empty_name():
+    from harvey.trainer import _validate_product_identity
+
+    valid, message = _validate_product_identity(
+        {"product_name": "  "},
+        {"https://example.com": "Example website"},
+    )
+
+    assert valid is False
+    assert "empty" in message.lower()
+
+def test_trainer_build_config_keeps_outreach_disabled(monkeypatch):
+    monkeypatch.setattr(trainer_module, "brain_section", lambda config: {})
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.brain_config = None
+
+    config = trainer._build_config(
+        product_info={
+            "company_name": "Example Inc",
+            "product_name": "Example CRM",
+        },
+        icp_info={},
+        objections={},
+        domain="example.com",
+    )
+
+    assert config["channels"]["email"]["enabled"] is False
+    assert config["channels"]["linkedin"]["enabled"] is False

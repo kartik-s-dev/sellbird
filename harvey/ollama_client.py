@@ -119,5 +119,18 @@ class OllamaClient:
 
         except OllamaError:
             raise
-        except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
-            raise OllamaError(f"Local Ollama request failed: {exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise OllamaError(
+                f"Local Ollama request timed out "
+                f"({type(exc).__name__}): {exc!r}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise OllamaError(
+                f"Local Ollama request failed "
+                f"({type(exc).__name__}): {exc!r}"
+            ) from exc
+        except (ValueError, TypeError, KeyError) as exc:
+            raise OllamaError(
+                f"Invalid local Ollama response "
+                f"({type(exc).__name__}): {exc!r}"
+            ) from exc

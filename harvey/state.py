@@ -1960,23 +1960,21 @@ class StateManager:
     async def get_usage_today(self, provider: str = "claude") -> int:
         """Brain calls made today on one provider's subscription."""
         column = _USAGE_LOG_COLUMN[provider]
-        today = date.today().isoformat()
         async with self._connect() as db:
             async with db.execute(
-                f"SELECT {column} FROM usage_log WHERE date = ?", (today,)
+                f"SELECT {column} FROM usage_log WHERE date = date('now')"
             ) as cursor:
                 row = await cursor.fetchone()
                 return (row[0] or 0) if row else 0
 
     async def increment_usage(self, provider: str = "claude"):
         column = _USAGE_LOG_COLUMN[provider]
-        today = date.today().isoformat()
         async with self._connect() as db:
             await db.execute(
                 f"""INSERT INTO usage_log (id, date, {column})
-                   VALUES (?, ?, 1)
+                   VALUES (?, date('now'), 1)
                    ON CONFLICT(date) DO UPDATE SET {column} = {column} + 1""",
-                (_new_id(), today),
+                (_new_id(),),
             )
             await db.commit()
 
@@ -2111,7 +2109,6 @@ class StateManager:
 
     async def get_state_summary(self) -> dict:
         prospect_counts = await self.count_prospects_by_status()
-        today = date.today().isoformat()
         async with self._connect() as db:
             async with db.execute(
                 """SELECT
@@ -2127,8 +2124,7 @@ class StateManager:
             ) as cursor:
                 open_conversations = (await cursor.fetchone())[0]
             async with db.execute(
-                "SELECT claude_calls, codex_calls, ollama_calls FROM usage_log WHERE date = ?",
-                (today,),
+                "SELECT claude_calls, codex_calls, ollama_calls FROM usage_log WHERE date = date('now')"
             ) as cursor:
                 usage_row = await cursor.fetchone()
                 usage_today = (usage_row[0] or 0) if usage_row else 0

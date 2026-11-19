@@ -43,6 +43,33 @@ def _generate_product_id(domain: str, product_name: str) -> str:
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return f"prod_{digest}"
 
+
+def _validate_product_identity(
+    product_info: dict,
+    scraped_pages: dict[str, str],
+) -> tuple[bool, str]:
+    """Require the extracted product name to appear in crawled source text."""
+    if not isinstance(product_info, dict):
+        return False, "Product extraction did not return a JSON object."
+
+    product_name = product_info.get("product_name")
+    if not isinstance(product_name, str) or not product_name.strip():
+        return False, "Extracted product name is empty."
+
+    source_text = " ".join(
+        str(content) for content in scraped_pages.values()
+    ).casefold()
+
+    normalized_name = " ".join(product_name.split()).casefold()
+
+    if normalized_name not in source_text:
+        return False, (
+            f"Product identity '{product_name}' was not found in crawled "
+            "website text. Refusing to save unverified training data."
+        )
+
+    return True, "Product name found in crawled website text."
+
 # Fallback: pages to try if Cloudflare crawl is unavailable
 FALLBACK_PATHS = [
     "/", "/about", "/about-us", "/pricing", "/features", "/product",
@@ -216,10 +243,13 @@ class FallbackCrawler:
         """Recursively crawl a website by following internal links."""
         pages: dict[str, str] = {}
         visited: set[str] = set()
-        domain = urlparse(base_url).netloc
+        # Start at the exact requested URL and scope discovered links
+        # to the same product path.
+        start = urlparse(base_url)
+        domain = start.netloc.lower()
 
-        # Queue starts with priority paths, then discovered links
-        queue: list[str] = [urljoin(base_url, p) for p in FALLBACK_PATHS]
+        queue: list[str] = [base_url]
+
 
         async with httpx.AsyncClient(
             timeout=15,
@@ -292,6 +322,7 @@ class FallbackCrawler:
         """Extract all internal links from an HTML page."""
         soup = BeautifulSoup(html, "html.parser")
         links = []
+        start_path = urlparse(base_url).path.rstrip("/") or "/"
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -303,9 +334,17 @@ class FallbackCrawler:
             full_url = urljoin(base_url, href)
             parsed = urlparse(full_url)
 
-            # Only internal links
-            if parsed.netloc == domain and parsed.scheme in ("http", "https"):
-                # Strip query params and fragments for cleaner crawling
+            # Only internal links inside the requested product path.
+            same_domain = parsed.netloc.lower() == domain
+            path = parsed.path.rstrip("/") or "/"
+            in_scope = (
+                start_path == "/"
+                or path == start_path
+                or path.startswith(start_path + "/")
+            )
+
+            if same_domain and in_scope and parsed.scheme in ("http", "https"):
+                # Strip query params and fragments for cleaner crawling.
                 clean = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
                 # Skip file downloads
                 if not any(clean.endswith(ext) for ext in (".pdf", ".zip", ".png", ".jpg", ".svg", ".css", ".js")):
@@ -329,6 +368,110 @@ def brain_section(brain_config: BrainConfig) -> dict:
     if brain_config.reasoning_effort:
         section["reasoning_effort"] = brain_config.reasoning_effort
     return section
+
+
+
+def _normalise_evidence_text(value: str) -> str:
+    """Normalise whitespace and case for source-quote matching."""
+    import re
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _claim_has_source_quote(claim, quote, source_text: str) -> bool:
+    """Check whether a supplied quote occurs in crawled source text."""
+    if not isinstance(claim, str) or not claim.strip():
+        return False
+    if not isinstance(quote, str) or not quote.strip():
+        return False
+    normalised_source = _normalise_evidence_text(source_text)
+    normalised_quote = _normalise_evidence_text(quote)
+    return bool(normalised_quote) and normalised_quote in normalised_source
+
+
+def _filter_evidence_claims(items, source_text: str) -> list:
+    """Keep claim/quote pairs whose quote occurs in source text."""
+    if not isinstance(items, list):
+        return []
+    accepted = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        claim = item.get("claim")
+        quote = item.get("quote")
+        if _claim_has_source_quote(claim, quote, source_text):
+            accepted.append(claim.strip())
+    return accepted
+
+
+def _validate_product_claims(product_info, scraped_pages) -> dict:
+    """Convert evidence-backed model output into the legacy product schema."""
+    if not isinstance(product_info, dict) or not isinstance(scraped_pages, dict):
+        return {}
+
+    source_text = " ".join(
+        str(content) for content in scraped_pages.values()
+        if content is not None
+    )
+    evidence = product_info.get("evidence")
+    if not isinstance(evidence, dict):
+        return {}
+
+    validated = {}
+    scalar_fields = (
+        "company_name", "product_name", "product_description",
+        "pricing", "target_audience", "value_proposition",
+    )
+    for field in scalar_fields:
+        item = evidence.get(field)
+        if isinstance(item, dict) and _claim_has_source_quote(
+            item.get("claim"), item.get("quote"), source_text
+        ):
+            validated[field] = item["claim"].strip()
+        else:
+            validated[field] = ""
+
+    list_fields = (
+        "key_benefits", "features", "differentiators", "competitors",
+        "social_proof", "integrations", "use_cases",
+    )
+    for field in list_fields:
+        validated[field] = _filter_evidence_claims(
+            evidence.get(field), source_text
+        )
+    return validated
+
+
+def _validate_icp_claims(icp_info, scraped_pages) -> dict:
+    """Keep ICP claims only when their evidence quote occurs in source text."""
+    if not isinstance(icp_info, dict) or not isinstance(scraped_pages, dict):
+        return {}
+
+    source_text = " ".join(
+        str(content) for content in scraped_pages.values()
+        if content is not None
+    )
+    evidence = icp_info.get("evidence")
+    if not isinstance(evidence, dict):
+        return {}
+
+    validated = {}
+    for field in (
+        "industries", "titles", "geography",
+        "pain_points", "buying_triggers", "disqualifiers",
+    ):
+        validated[field] = _filter_evidence_claims(
+            evidence.get(field), source_text
+        )
+
+    for field in ("company_size", "buyer_persona"):
+        item = evidence.get(field)
+        if isinstance(item, dict) and _claim_has_source_quote(
+            item.get("claim"), item.get("quote"), source_text
+        ):
+            validated[field] = item["claim"].strip()
+        else:
+            validated[field] = ""
+    return validated
 
 
 class Trainer:
@@ -410,7 +553,7 @@ class Trainer:
             print(f"\nERROR: '{url}' doesn't look like a valid URL.")
             print("Try something like: https://yourcompany.com")
             return None
-        base_url = f"{parsed.scheme}://{domain}"
+        base_url = url
 
         logger.info(f"Training Harvey on {base_url}...")
         print(f"\n{'='*60}")
@@ -446,6 +589,16 @@ class Trainer:
         if not product_info:
             print("ERROR: Could not extract product information.")
             return None
+
+        identity_valid, identity_message = _validate_product_identity(
+            product_info, self.scraped_pages
+        )
+        if not identity_valid:
+            print(f"ERROR: Product identity validation failed: {identity_message}")
+            print("Training stopped. No product, YAML, or skill files were saved.")
+            return None
+
+        print(f"      Identity verified: {identity_message}")
         print(f"      Found: {product_info.get('product_name', 'Unknown Product')}\n")
 
         # Step 3: Identify ICP
@@ -510,100 +663,108 @@ class Trainer:
         return config
 
     def _get_all_content(self, max_chars: int = 60000) -> str:
-        """Combine all scraped pages into one string for analysis."""
-        all_content = ""
+        """Combine scraped pages without exceeding the total character budget."""
+        if max_chars <= 0:
+            return ""
+
+        parts = []
+        remaining = max_chars
+
         for url, content in self.scraped_pages.items():
-            path = urlparse(url).path or "/"
-            # Truncate individual pages to keep total manageable
-            page_content = content[:8000] if len(content) > 8000 else content
-            all_content += f"\n\n--- PAGE: {path} ---\n{page_content}"
-            if len(all_content) > max_chars:
+            if remaining <= 0:
                 break
-        return all_content
+
+            path = urlparse(url).path or "/"
+            header = f"\n\n--- PAGE: {path} ---\n"
+            if len(header) >= remaining:
+                parts.append(header[:remaining])
+                break
+
+            parts.append(header)
+            remaining -= len(header)
+
+            page_content = str(content)[:min(8000, remaining)]
+            parts.append(page_content)
+            remaining -= len(page_content)
+
+        return "".join(parts)
 
     async def _extract_product_info(self) -> dict:
-        """Ask Claude to extract product information from all crawled content."""
-        all_content = self._get_all_content()
+        """Extract product claims only when accompanied by source quotes."""
+        all_content = self._get_all_content(max_chars=12000)
 
-        prompt = f"""Analyze this entire website and extract comprehensive product/company information.
+        prompt = f"""Extract product information ONLY from this website content.
 
-WEBSITE CONTENT ({len(self.scraped_pages)} pages):
+WEBSITE CONTENT:
 {all_content}
 
-Extract the following and return as JSON:
+Return JSON in this exact structure:
 {{
-  "company_name": "the company name",
-  "product_name": "the main product or service name",
-  "product_description": "2-3 sentence description of what the product does and who it's for",
-  "pricing": "pricing info if available (tiers, starting price, etc.), otherwise 'Contact for pricing'",
-  "key_benefits": ["benefit 1", "benefit 2", "benefit 3", "benefit 4", "benefit 5"],
-  "features": ["feature 1", "feature 2", "feature 3", "feature 4", "feature 5", "feature 6"],
-  "target_audience": "who this product is for — be specific about roles and company types",
-  "value_proposition": "the core value proposition in one sentence",
-  "differentiators": ["what makes this different from alternatives — point 1", "point 2"],
-  "competitors": ["competitor 1", "competitor 2", "competitor 3"],
-  "social_proof": ["any case studies, testimonials, notable customers, or stats mentioned"],
-  "integrations": ["tools and platforms this integrates with"],
-  "use_cases": ["specific use case 1", "use case 2", "use case 3"],
-  "tone": "describe the brand's communication tone in 3-4 words"
+  "evidence": {{
+    "company_name": {{"claim": "", "quote": ""}},
+    "product_name": {{"claim": "", "quote": ""}},
+    "product_description": {{"claim": "", "quote": ""}},
+    "pricing": {{"claim": "", "quote": ""}},
+    "target_audience": {{"claim": "", "quote": ""}},
+    "value_proposition": {{"claim": "", "quote": ""}},
+    "key_benefits": [{{"claim": "", "quote": ""}}],
+    "features": [{{"claim": "", "quote": ""}}],
+    "differentiators": [{{"claim": "", "quote": ""}}],
+    "competitors": [{{"claim": "", "quote": ""}}],
+    "social_proof": [{{"claim": "", "quote": ""}}],
+    "integrations": [{{"claim": "", "quote": ""}}],
+    "use_cases": [{{"claim": "", "quote": ""}}]
+  }}
 }}
 
-Be thorough — you have access to the full website. Extract everything relevant."""
+Rules:
+- Every quote must be copied exactly from the supplied website content.
+- Every claim must be directly supported by its quote.
+- Never infer or use outside knowledge.
+- Never invent competitors, features, benefits, prices, customers, integrations or results.
+- Use empty strings or lists when evidence is unavailable.
+- Do not force a fixed number of items.
+- Return JSON only."""
 
         result = await self.brain.think_json(prompt, session_id="harvey-trainer")
-        return result if isinstance(result, dict) else {}
+        return _validate_product_claims(result, self.scraped_pages)
+
 
     async def _extract_icp(self) -> dict:
-        """Ask Claude to determine the ideal customer profile from all content."""
+        """Extract ICP claims only when accompanied by source quotes."""
         all_content = self._get_all_content(max_chars=40000)
 
-        prompt = f"""Based on this entire website, determine the Ideal Customer Profile (ICP).
-Look at case studies, testimonials, pricing tiers, feature descriptions, and target messaging
-to understand exactly who this product is built for.
+        prompt = f"""Extract an Ideal Customer Profile ONLY from explicit website evidence.
 
-WEBSITE CONTENT ({len(self.scraped_pages)} pages):
+WEBSITE CONTENT:
 {all_content}
 
-Return as JSON:
+Return JSON in this exact structure:
 {{
-  "industries": ["industry 1", "industry 2", "industry 3"],
-  "company_size": "employee range like '10-200 employees'",
-  "titles": ["decision maker title 1", "title 2", "title 3", "title 4"],
-  "geography": ["country or region 1", "region 2"],
-  "buyer_persona": "A detailed description of the ideal buyer — their role, daily challenges, goals, and what success looks like for them",
-  "pain_points": ["specific pain point 1", "pain point 2", "pain point 3", "pain point 4"],
-  "buying_triggers": ["trigger event that makes them ready to buy 1", "trigger 2", "trigger 3"],
-  "disqualifiers": ["signals that someone is NOT a good fit 1", "disqualifier 2"]
+  "evidence": {{
+    "industries": [{{"claim": "", "quote": ""}}],
+    "company_size": {{"claim": "", "quote": ""}},
+    "titles": [{{"claim": "", "quote": ""}}],
+    "geography": [{{"claim": "", "quote": ""}}],
+    "buyer_persona": {{"claim": "", "quote": ""}},
+    "pain_points": [{{"claim": "", "quote": ""}}],
+    "buying_triggers": [{{"claim": "", "quote": ""}}],
+    "disqualifiers": [{{"claim": "", "quote": ""}}]
+  }}
 }}
 
-For any city in "geography", always include the state/province and country if
-the name could plausibly refer to more than one place — write "Solon, Ohio"
-not "Solon" (there's also a Solon in France), "Springfield, Illinois" not
-"Springfield" (30+ US cities share that name). These strings get geocoded
-automatically for local-business discovery, and an unqualified name silently
-resolves to the wrong place on Earth instead of failing loudly.
-
-"titles" MUST be literal job titles exactly as they'd appear on a business
-card or LinkedIn profile ("Owner", "CEO", "President", "Plant Manager",
-"Practice Manager") — never a customer-segment or persona label ("Business
-Owner Segment", "Decision Maker", "Healthcare Professional"). Harvey matches
-a found contact's title against this list by substring, so a descriptive
-label instead of a real title means every real contact silently fails to
-match and gets discarded. If the buyer is an INDIVIDUAL bought into by
-persona rather than a role at a target company (e.g. this product targets
-physicians, business owners, or executives directly as people, not a
-"Director of X" at a company you sell software to), list every real job
-title that persona plausibly holds — a "business owner" persona should
-produce ["Owner", "President", "CEO", "Founder", "Managing Partner"], a
-"physician" persona should produce ["Physician", "MD", "Doctor"], and so on.
-Prefer more titles over fewer; a missed real title costs a contact forever,
-an extra one costs nothing.
-
-Be specific — don't guess generically. Base this on what the website actually says about their customers."""
+Rules:
+- Every quote must be copied exactly from the supplied website content.
+- Every claim must be directly supported by its quote.
+- Do not infer company size, industries, job titles, geography or buyer needs.
+- Do not invent plausible job titles or expand a persona into unsupported titles.
+- Preserve the source wording for geography; do not guess missing locations.
+- Use empty strings or lists when evidence is unavailable.
+- Return JSON only."""
 
         result = await self.brain.think_json(prompt, session_id="harvey-trainer")
-        # Do not invent an ICP when extraction fails.
-        return result if isinstance(result, dict) else {}
+        return _validate_icp_claims(result, self.scraped_pages)
+
 
     async def _extract_competitive_intel(self, product_info: dict) -> dict:
         """Extract competitive positioning and differentiators."""
@@ -649,7 +810,26 @@ STRICT EVIDENCE RULES:
     async def _generate_objections(self, product_info: dict, competitive_intel: dict) -> dict:
         """Generate objection handling responses based on product + competitive intel."""
         competitors = competitive_intel.get("competitors", [])
-        competitor_names = [c.get("name", "") for c in competitors if isinstance(c, dict)]
+
+        def safe_text_list(value):
+            if not isinstance(value, list):
+                return []
+            return [
+                item.strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            ]
+
+        competitor_names = [
+            name.strip()
+            for name in (
+                c.get("name", "") for c in competitors if isinstance(c, dict)
+            )
+            if isinstance(name, str) and name.strip()
+        ]
+
+        key_benefits = safe_text_list(product_info.get("key_benefits"))
+        differentiators = safe_text_list(product_info.get("differentiators"))
 
         prompt = f"""You are a B2B sales trainer. Generate practical objection responses using only
 the supplied product information and explicitly supported competitive information.
@@ -663,9 +843,9 @@ Evidence rules:
 Product: {product_info.get('product_name', '')}
 Description: {product_info.get('product_description', '')}
 Pricing: {product_info.get('pricing', '')}
-Key Benefits: {', '.join(product_info.get('key_benefits', []))}
+Key Benefits: {', '.join(key_benefits)}
 Competitors: {', '.join(competitor_names)}
-Differentiators: {', '.join(product_info.get('differentiators', []))}
+Differentiators: {', '.join(differentiators)}
 
 Generate 8-12 objections covering:
 - Price/budget concerns
@@ -900,12 +1080,12 @@ Use these only when the source material supports the claims.
             },
             "channels": {
                 "email": {
-                    "enabled": True,
+                    "enabled": False,
                     "provider": "instantly",
                     "max_daily_sends": 50,
                 },
                 "linkedin": {
-                    "enabled": True,
+                    "enabled": False,
                     "max_daily_connections": 20,
                     "max_daily_messages": 10,
                 },
