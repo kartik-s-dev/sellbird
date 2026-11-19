@@ -767,19 +767,94 @@ class Brain:
             )
         return template
 
-    def load_skill(self, skill_name: str) -> str:
-        """Load a skill knowledge file from the skills/ directory."""
-        skill_file = SKILLS_DIR / f"{skill_name}.md"
+    def load_skill(self, skill_name: str, product_id: str | None = None) -> str:
+        """Load shared skills or strictly isolated product-specific skills."""
+        product_skills = {"product_knowledge", "competitive_intel"}
+
+        if product_id is not None and skill_name in product_skills:
+            if (
+                not isinstance(product_id, str)
+                or not product_id
+                or len(product_id) > 128
+                or not product_id.isascii()
+                or not all(ch.isalnum() or ch in "_-" for ch in product_id)
+            ):
+                logger.error("Invalid product ID; refusing skill path access.")
+                return ""
+
+            skill_file = SKILLS_DIR / "products" / product_id / f"{skill_name}.md"
+        elif skill_name in product_skills:
+            skill_file = SKILLS_DIR / f"{skill_name}.md"
+        else:
+            skill_file = SKILLS_DIR / f"{skill_name}.md"
+
         try:
-            return skill_file.read_text()
+            return skill_file.read_text(encoding="utf-8")
         except FileNotFoundError:
-            logger.warning(f"Skill file not found: {skill_file}")
+            logger.warning("Skill file not found: %s", skill_file)
             return ""
         except OSError as e:
-            logger.error(f"Could not read skill file {skill_file}: {e}")
+            logger.error("Could not read skill file %s: %s", skill_file, e)
+            return ""
+    def load_skills_for_agent(
+        self,
+        agent_name: str,
+        product_id: str | None = None,
+    ) -> str:
+        """Load agent skills, using isolated product knowledge when requested."""
+        skill_map = {
+            "scout": [
+                "prospecting_tactics",
+                "lead_qualification",
+                "account_navigation",
+                "signal_playbook",
+                "product_knowledge",
+            ],
+            "writer": [
+                "email_frameworks",
+                "signal_playbook",
+                "sales_methodology",
+                "offer_strategy",
+                "product_knowledge",
+                "competitive_intel",
+            ],
+            "handler": [
+                "objection_handling",
+                "sales_methodology",
+                "offer_strategy",
+                "product_knowledge",
+                "competitive_intel",
+            ],
+            "sender": [
+                "email_frameworks",
+                "product_knowledge",
+            ],
+            "linkedin": [
+                "linkedin_outreach",
+                "prospecting_tactics",
+                "product_knowledge",
+            ],
+        }
+
+        skill_names = skill_map.get(agent_name, [])
+        if not skill_names:
             return ""
 
-    def load_skills_for_agent(self, agent_name: str) -> str:
+        sections = []
+
+        for name in skill_names:
+            content = self.load_skill(name, product_id=product_id)
+            if content:
+                sections.append(content)
+
+        if not sections:
+            return ""
+
+        return (
+            "\n\n---\n## FOUNDATIONAL KNOWLEDGE\n"
+            "Use the following frameworks and best practices to guide your work:\n\n"
+            + "\n\n---\n\n".join(sections)
+        )
         """Load all relevant skills for a specific sub-agent.
 
         Returns concatenated skill content that should be injected

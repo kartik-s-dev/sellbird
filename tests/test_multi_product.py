@@ -1,4 +1,5 @@
 from harvey.agents.scout import Scout
+from harvey.brain import Brain
 """Tests for multi-product data models."""
 
 import pytest
@@ -9,6 +10,7 @@ from harvey.models.company import Company
 from harvey.models.prospect import Prospect
 from harvey.state import StateManager
 from harvey.trainer import Trainer
+import harvey.trainer as trainer_module
 
 
 def test_product_creation():
@@ -367,3 +369,115 @@ async def test_scout_without_product_id_does_not_create_product_link(tmp_path):
     linked = await state.get_product_prospects("p1")
 
     assert linked == []
+
+def test_brain_empty_product_id_does_not_load_shared_product_knowledge(tmp_path, monkeypatch):
+    import harvey.brain as brain_module
+
+    shared = tmp_path / "product_knowledge.md"
+    shared.write_text("SHARED PRODUCT SECRET", encoding="utf-8")
+    monkeypatch.setattr(brain_module, "SKILLS_DIR", tmp_path)
+
+    brain = Brain.__new__(Brain)
+    result = brain.load_skill("product_knowledge", product_id="")
+
+    assert result == ""
+
+
+def test_brain_rejects_unsafe_product_id(tmp_path, monkeypatch):
+    import harvey.brain as brain_module
+
+    monkeypatch.setattr(brain_module, "SKILLS_DIR", tmp_path)
+    brain = Brain.__new__(Brain)
+
+    result = brain.load_skill("product_knowledge", product_id="../outside")
+
+    assert result == ""
+
+
+def test_brain_missing_product_skill_does_not_fallback_to_shared_file(tmp_path, monkeypatch):
+    import harvey.brain as brain_module
+
+    shared = tmp_path / "product_knowledge.md"
+    shared.write_text("SHARED PRODUCT SECRET", encoding="utf-8")
+    monkeypatch.setattr(brain_module, "SKILLS_DIR", tmp_path)
+
+    brain = Brain.__new__(Brain)
+    result = brain.load_skill("product_knowledge", product_id="productA")
+
+    assert result == ""
+
+def test_brain_loads_generated_product_id(tmp_path, monkeypatch):
+    import harvey.brain as brain_module
+    from harvey.brain import Brain
+
+    product_id = "prod_" + "a" * 64
+    product_dir = tmp_path / "products" / product_id
+    product_dir.mkdir(parents=True)
+    (product_dir / "product_knowledge.md").write_text(
+        "PRODUCT-SPECIFIC KNOWLEDGE", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(brain_module, "SKILLS_DIR", tmp_path)
+    brain = Brain.__new__(Brain)
+
+    result = brain.load_skill("product_knowledge", product_id=product_id)
+
+    assert result == "PRODUCT-SPECIFIC KNOWLEDGE"
+
+@pytest.mark.asyncio
+async def test_trainer_removes_only_its_own_stale_battle_cards(tmp_path, monkeypatch):
+    monkeypatch.setattr(trainer_module, "PROJECT_ROOT", tmp_path)
+
+    product_a = tmp_path / "skills" / "products" / "product_a"
+    product_b = tmp_path / "skills" / "products" / "product_b"
+    product_a.mkdir(parents=True)
+    product_b.mkdir(parents=True)
+
+    stale_file = product_a / "competitive_intel.md"
+    other_file = product_b / "competitive_intel.md"
+    stale_file.write_text("Old Product A intelligence", encoding="utf-8")
+    other_file.write_text("Product B intelligence", encoding="utf-8")
+
+    trainer = Trainer.__new__(Trainer)
+    await trainer._generate_battle_cards(
+        {"product_name": "Product A"},
+        {"competitors": []},
+        "product_a",
+    )
+
+    assert not stale_file.exists()
+    assert other_file.read_text(encoding="utf-8") == "Product B intelligence"
+
+
+@pytest.mark.asyncio
+async def test_trainer_generates_product_specific_battle_cards(tmp_path, monkeypatch):
+    monkeypatch.setattr(trainer_module, "PROJECT_ROOT", tmp_path)
+
+    trainer = Trainer.__new__(Trainer)
+    await trainer._generate_battle_cards(
+        {"product_name": "Product A"},
+        {
+            "positioning": "Evidence-backed positioning",
+            "unique_strengths": ["Verified strength"],
+            "common_alternatives": ["Manual workflow"],
+            "competitors": [
+                {
+                    "name": "Competitor X",
+                    "how_we_win": "Not established",
+                    "their_weakness": "Not established",
+                    "migration_angle": "Not established",
+                }
+            ],
+        },
+        "product_a",
+    )
+
+    generated_file = (
+        tmp_path / "skills" / "products" / "product_a" / "competitive_intel.md"
+    )
+    assert generated_file.exists()
+
+    content = generated_file.read_text(encoding="utf-8")
+    assert "Competitor X" in content
+    assert "Verified strength" in content
+    assert "Not established" in content

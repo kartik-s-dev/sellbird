@@ -32,7 +32,7 @@ class FakeConfig:
 
 
 class FakeBrain:
-    def load_skills_for_agent(self, agent):
+    def load_skills_for_agent(self, agent, product_id=None):
         return ""
 
     def load_prompt(self, *args, **kwargs):

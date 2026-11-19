@@ -91,7 +91,7 @@ class Writer:
         """Create email campaigns for prospects that need outreach."""
         logger.info("Writer: Crafting email campaigns...")
 
-        self.skills = self.brain.load_skills_for_agent("writer") or ""
+        self.skills = self.brain.load_skills_for_agent("writer", product_id=self.product_id) or ""
 
         try:
             new_prospects = await self._get_new_prospects()

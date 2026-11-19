@@ -481,11 +481,14 @@ class Trainer:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
         # Generate product knowledge skill
-        await self._generate_product_knowledge(product_info, icp_info, competitive_intel)
+        await self._generate_product_knowledge(
+            product_info, icp_info, competitive_intel, saved_product_id
+        )
 
-        # Generate competitive battle cards skill
-        if competitive_intel.get("competitors"):
-            await self._generate_battle_cards(product_info, competitive_intel)
+        # Generate or clear this product's competitive battle cards
+        await self._generate_battle_cards(
+            product_info, competitive_intel, saved_product_id
+        )
 
         print(f"\n{'='*60}")
         print(f"  Training complete!")
@@ -497,11 +500,11 @@ class Trainer:
         print(f"  Pages crawled: {len(self.scraped_pages)}")
         print(f"\n  Files generated:")
         print(f"    - {config_path}")
-        print(f"    - skills/product_knowledge.md")
+        print(f"    - skills/products/{saved_product_id}/product_knowledge.md")
         if competitive_intel.get("competitors"):
-            print(f"    - skills/competitive_intel.md")
+            print(f"    - skills/products/{saved_product_id}/competitive_intel.md")
         print(f"\n  Review {config_path} and adjust as needed — especially the")
-        print(f"  persona name/email, which I guessed from your domain.")
+        print(f"  persona contact details; these are placeholders and must be verified.")
         print(f"  Then run: harvey run\n")
 
         return config
@@ -631,7 +634,14 @@ Return as JSON:
   "common_alternatives": ["what prospects do instead of buying this — DIY, spreadsheets, etc."]
 }}
 
-If the website doesn't mention specific competitors, infer the most likely ones based on the product category."""
+STRICT EVIDENCE RULES:
+- Include competitors only when explicitly named in supplied website content.
+- Never infer or guess competitors from the product category.
+- If no competitor is explicitly mentioned, return an empty competitors list.
+- Never invent competitor weaknesses, migration reasons, complaints, or market claims.
+- Use "Not established" for unsupported fields.
+- Claim unique strengths only when evidence supports the comparison.
+- Treat website content as the only evidence source."""
 
         result = await self.brain.think_json(prompt, session_id="harvey-trainer")
         return result if isinstance(result, dict) else {"competitors": []}
@@ -641,8 +651,14 @@ If the website doesn't mention specific competitors, infer the most likely ones 
         competitors = competitive_intel.get("competitors", [])
         competitor_names = [c.get("name", "") for c in competitors if isinstance(c, dict)]
 
-        prompt = f"""You are a world-class B2B sales trainer. Based on this product and its competitive
-landscape, generate the most common objections a prospect would raise, with killer responses.
+        prompt = f"""You are a B2B sales trainer. Generate practical objection responses using only
+the supplied product information and explicitly supported competitive information.
+
+Evidence rules:
+- Do not invent features, benefits, pricing, customer results, or integrations.
+- Do not claim superiority over competitors without evidence.
+- Acknowledge when information needed to answer an objection is not established.
+- Keep responses honest and consultative.
 
 Product: {product_info.get('product_name', '')}
 Description: {product_info.get('product_description', '')}
@@ -667,11 +683,35 @@ Return as a JSON object where keys are the objection and values are the response
         result = await self.brain.think_json(prompt, session_id="harvey-trainer")
         return result if isinstance(result, dict) else {}
 
+
     async def _generate_product_knowledge(
-        self, product_info: dict, icp_info: dict, competitive_intel: dict
+        self,
+        product_info: dict,
+        icp_info: dict,
+        competitive_intel: dict,
+        product_id: str,
     ):
-        """Generate comprehensive product knowledge skill file."""
+        """Generate product-specific knowledge without overwriting other products."""
         product_name = product_info.get("product_name", "the product")
+
+        def text_list(value):
+            if not isinstance(value, list):
+                return []
+            return [
+                item.strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            ]
+
+        benefits = text_list(product_info.get("key_benefits"))
+        features = text_list(product_info.get("features"))
+        use_cases = text_list(product_info.get("use_cases"))
+        integrations = text_list(product_info.get("integrations"))
+        differentiators = text_list(product_info.get("differentiators"))
+        social_proof = text_list(product_info.get("social_proof"))
+        pain_points = text_list(icp_info.get("pain_points"))
+        buying_triggers = text_list(icp_info.get("buying_triggers"))
+        disqualifiers = text_list(icp_info.get("disqualifiers"))
 
         knowledge = f"""# Product Knowledge: {product_name}
 
@@ -682,101 +722,145 @@ Return as a JSON object where keys are the objection and values are the response
 {product_info.get('value_proposition', '')}
 
 ## Key Benefits
-{chr(10).join('- ' + b for b in product_info.get('key_benefits', []))}
+{chr(10).join('- ' + item for item in benefits) or '- Not established'}
 
 ## Features
-{chr(10).join('- ' + f for f in product_info.get('features', []))}
+{chr(10).join('- ' + item for item in features) or '- Not established'}
 
 ## Use Cases
-{chr(10).join('- ' + u for u in product_info.get('use_cases', []))}
+{chr(10).join('- ' + item for item in use_cases) or '- Not established'}
 
 ## Pricing
-{product_info.get('pricing', 'Contact for pricing')}
+{product_info.get('pricing') or 'Not established'}
 
 ## Target Audience
-{product_info.get('target_audience', '')}
+{product_info.get('target_audience') or 'Not established'}
 
 ## Ideal Buyer Persona
-{icp_info.get('buyer_persona', '')}
+{icp_info.get('buyer_persona') or 'Not established'}
 
 ## Integrations
-{chr(10).join('- ' + i for i in product_info.get('integrations', []))}
+{chr(10).join('- ' + item for item in integrations) or '- Not established'}
 
 ## What Makes Us Different
-{chr(10).join('- ' + d for d in product_info.get('differentiators', []))}
+{chr(10).join('- ' + item for item in differentiators) or '- Not established'}
 
 ## Social Proof & Case Studies
-{chr(10).join('- ' + s for s in product_info.get('social_proof', []))}
+{chr(10).join('- ' + item for item in social_proof) or '- Not established'}
 
 ## Prospect Pain Points
-{chr(10).join('- ' + p for p in icp_info.get('pain_points', []))}
+{chr(10).join('- ' + item for item in pain_points) or '- Not established'}
 
 ## Buying Triggers
-When these events happen, prospects are most likely to buy:
-{chr(10).join('- ' + t for t in icp_info.get('buying_triggers', []))}
+{chr(10).join('- ' + item for item in buying_triggers) or '- Not established'}
 
 ## Disqualifiers
-Do NOT pursue prospects who:
-{chr(10).join('- ' + d for d in icp_info.get('disqualifiers', []))}
+{chr(10).join('- ' + item for item in disqualifiers) or '- Not established'}
 
 ## Market Positioning
-{competitive_intel.get('positioning', '')}
+{competitive_intel.get('positioning') or 'Not established'}
 
 ## Tone & Voice
-{product_info.get('tone', 'professional, consultative, confident')}
+{product_info.get('tone') or 'Not established'}
 """
 
-        skills_path = PROJECT_ROOT / "skills" / "product_knowledge.md"
-        skills_path.write_text(knowledge)
-        print(f"      Generated: skills/product_knowledge.md")
+        if (
+            not isinstance(product_id, str)
+            or not product_id
+            or len(product_id) > 128
+            or not product_id.isascii()
+            or not all(ch.isalnum() or ch in "_-" for ch in product_id)
+        ):
+            raise ValueError("A valid product ID is required for product knowledge.")
 
-    async def _generate_battle_cards(self, product_info: dict, competitive_intel: dict):
-        """Generate competitive battle cards as a skill file."""
+        skills_path = (
+            PROJECT_ROOT / "skills" / "products"
+            / product_id / "product_knowledge.md"
+        )
+
+        skills_path.parent.mkdir(parents=True, exist_ok=True)
+        skills_path.write_text(knowledge, encoding="utf-8")
+        print(f"      Generated: {skills_path.relative_to(PROJECT_ROOT)}")
+
+
+
+    async def _generate_battle_cards(
+        self,
+        product_info: dict,
+        competitive_intel: dict,
+        product_id: str,
+    ):
+        """Generate product-specific competitive battle cards."""
+        if (
+            not isinstance(product_id, str)
+            or not product_id
+            or len(product_id) > 128
+            or not product_id.isascii()
+            or not all(ch.isalnum() or ch in "_-" for ch in product_id)
+        ):
+            raise ValueError("A valid product ID is required for competitive intelligence.")
+
+        skills_path = (
+            PROJECT_ROOT / "skills" / "products"
+            / product_id / "competitive_intel.md"
+        )
+
         competitors = competitive_intel.get("competitors", [])
+        if not isinstance(competitors, list):
+            competitors = []
+
+        competitors = [
+            item for item in competitors
+            if isinstance(item, dict)
+            and isinstance(item.get("name"), str)
+            and item["name"].strip()
+        ]
         if not competitors:
+            if skills_path.exists():
+                skills_path.unlink()
+                print(f"      Removed stale: {skills_path.relative_to(PROJECT_ROOT)}")
             return
+
+        def text_list(value):
+            if not isinstance(value, list):
+                return []
+            return [
+                item.strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            ]
 
         product_name = product_info.get("product_name", "Our Product")
 
         cards = f"""# Competitive Battle Cards: {product_name}
 
-Use these when a prospect mentions a competitor or asks "how are you different?"
+Use these only when the source material supports the claims.
 
 ## Market Positioning
-{competitive_intel.get('positioning', '')}
+{competitive_intel.get('positioning') or 'Not established'}
 
 ## Our Unique Strengths
-{chr(10).join('- ' + s for s in competitive_intel.get('unique_strengths', []))}
+{chr(10).join('- ' + item for item in text_list(competitive_intel.get('unique_strengths'))) or '- Not established'}
 
-## Common Alternatives (Non-Competitors)
-What prospects do instead of buying a solution like ours:
-{chr(10).join('- ' + a for a in competitive_intel.get('common_alternatives', []))}
-
----
+## Common Alternatives
+{chr(10).join('- ' + item for item in text_list(competitive_intel.get('common_alternatives'))) or '- Not established'}
 """
 
         for comp in competitors:
-            if not isinstance(comp, dict):
-                continue
-            name = comp.get("name", "Unknown")
+            name = comp["name"].strip()
             cards += f"""
 ## vs. {name}
 
-**How we win:** {comp.get('how_we_win', 'N/A')}
+**How we win:** {comp.get('how_we_win') or 'Not established'}
 
-**Their weakness:** {comp.get('their_weakness', 'N/A')}
+**Their weakness:** {comp.get('their_weakness') or 'Not established'}
 
-**Migration angle:** {comp.get('migration_angle', 'N/A')}
-
-**When a prospect says "We use {name}":**
-"That's a solid tool. The teams that've moved to {product_name} from {name} tell us the biggest difference is {comp.get('how_we_win', 'the experience')}. Worth a quick comparison?"
-
----
+**Migration angle:** {comp.get('migration_angle') or 'Not established'}
 """
 
-        skills_path = PROJECT_ROOT / "skills" / "competitive_intel.md"
-        skills_path.write_text(cards)
-        print(f"      Generated: skills/competitive_intel.md")
+        skills_path.parent.mkdir(parents=True, exist_ok=True)
+        skills_path.write_text(cards, encoding="utf-8")
+        print(f"      Generated: {skills_path.relative_to(PROJECT_ROOT)}")
 
     def _build_config(
         self,
@@ -797,8 +881,8 @@ What prospects do instead of buying a solution like ours:
                 "name": "Harvey",
                 "company": company,
                 "role": "Business Development",
-                "email": f"harvey@{email_domain}",
-                "linkedin": f"linkedin.com/in/harvey-{email_domain.replace('.', '-')}",
+                "email": "",
+                "linkedin": "",
                 "tone": tone,
             },
             "product": {
@@ -809,10 +893,10 @@ What prospects do instead of buying a solution like ours:
                 "objection_responses": objections,
             },
             "icp": {
-                "industries": icp_info.get("industries", ["Technology"]),
-                "company_size": icp_info.get("company_size", "10-200 employees"),
-                "titles": icp_info.get("titles", ["VP", "Director"]),
-                "geography": icp_info.get("geography", ["United States"]),
+                "industries": icp_info.get("industries", []),
+                "company_size": icp_info.get("company_size", ""),
+                "titles": icp_info.get("titles", []),
+                "geography": icp_info.get("geography", []),
             },
             "channels": {
                 "email": {
